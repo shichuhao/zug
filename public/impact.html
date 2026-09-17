@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>施工与天气对晚点的影响 · 影响分析</title>
+  <meta name="description" content="德国铁路施工、天气与官方事件对列车晚点影响的数据分析。" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="style.css" />
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('theme');
+        if (!t) { t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light'; }
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+  <style>
+    .impact-wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px 40px; }
+    .impact-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 18px 0 6px; }
+    .impact-head h1 { margin: 0; font-size: 22px; font-weight: 700; }
+    .impact-head .back-link { color: var(--link, #155e75); text-decoration: none; font-size: 13px; white-space: nowrap; }
+    [data-theme="dark"] .impact-head .back-link { color: #8ab4f8; }
+    .impact-head .back-link:hover { text-decoration: underline; }
+    .impact-sub { color: var(--muted, #687583); font-size: 12px; margin: 0 0 16px; }
+    .impact-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 14px 0 20px; }
+    .impact-metrics .card { background: var(--surface, #fff); border: 1px solid var(--border, #dce3e8); border-radius: 10px; padding: 14px 16px; }
+    .impact-metrics .card .lbl { color: var(--muted, #687583); font-size: 12px; }
+    .impact-metrics .card .val { font-size: 26px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .impact-metrics .card .val small { font-size: 13px; font-weight: 400; color: var(--muted, #687583); }
+    .impact-panel { background: var(--surface, #fff); border: 1px solid var(--border, #dce3e8); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+    .impact-panel h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+    .impact-panel .note { color: var(--muted, #687583); font-size: 12px; margin: 0 0 12px; }
+    .impact-panel table { width: 100%; border-collapse: collapse; }
+    .impact-panel th { color: #5b6470; background: var(--canvas, #f5f7f8); font-weight: 600; text-align: left; font-size: 12px; padding: 8px 12px; }
+    .impact-panel td { padding: 8px 12px; border-top: 1px solid var(--border, #dce3e8); font-variant-numeric: tabular-nums; font-size: 13px; }
+    .bar-bg { background: var(--canvas, #f5f7f8); border-radius: 3px; height: 10px; overflow: hidden; min-width: 90px; }
+    .bar-fill { height: 100%; background: #ba2c2c; border-radius: 3px; }
+    .bar-fill.wx { background: #155e75; }
+    .lvl-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+    .lvl-low { background: #e8f5ee; color: #18794e; }
+    .lvl-medium { background: #fff2d6; color: #9a5700; }
+    .lvl-high { background: #fde9e9; color: #ba2c2c; }
+    .impact-foot { color: var(--muted, #687583); font-size: 11px; margin-top: 10px; }
+    .impact-loading, .impact-error { padding: 40px; text-align: center; color: var(--muted, #687583); }
+    .impact-error button { margin-left: 8px; }
+    /* 加载骨架屏：shimmer 扫光 */
+    .skeleton { position: relative; overflow: hidden; background: var(--surface, #fff); border: 1px solid var(--border, #dce3e8); border-radius: 10px; }
+    .skeleton::after { content: ""; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, rgba(125,140,155,.14), transparent); animation: skShimmer 1.4s infinite; }
+    [data-theme="dark"] .skeleton::after { background: linear-gradient(90deg, transparent, rgba(255,255,255,.09), transparent); }
+    .skeleton .sk-line { height: 12px; width: 42%; margin: 14px 16px 0; border-radius: 4px; background: var(--canvas, #f5f7f8); }
+    .skeleton .sk-line.big { height: 26px; width: 68%; margin: 8px 16px 14px; }
+    .skeleton.panel-sk { height: 170px; }
+    @keyframes skShimmer { 100% { transform: translateX(100%); } }
+    @keyframes fadeInUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    .impact-metrics .card, .impact-panel { animation: fadeInUp .35s ease both; }
+    /* 数据缺失 / 加载失败时隐藏指标卡（display:grid 会覆盖 [hidden] 的 UA 样式） */
+    .impact-metrics[hidden] { display: none; }
+    .region-name { font-weight: 600; }
+    @media (max-width: 760px) {
+      .impact-metrics { grid-template-columns: repeat(2, 1fr); }
+      .impact-wrap { padding: 0 14px 30px; }
+      .impact-panel { overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <!-- 页面级右上角操作区：深色切换（与主页共用 localStorage theme，互通） -->
+  <div class="top-actions">
+    <button id="themeToggle" class="theme-toggle" type="button" title="切换深色 / 浅色模式" aria-label="切换深色 / 浅色模式" data-i18n-title="btn.themeTitle" data-i18n-aria="btn.themeTitle">🌙</button>
+  </div>
+  <main class="impact-wrap">
+    <div class="impact-head">
+      <a class="back-link" href="/" data-i18n="impact.back">← 返回查询</a>
+      <h1 data-i18n="impact.title">施工与天气对晚点的影响</h1>
+      <div class="lang-area" style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+        <span class="lang-label" data-i18n="lang.label">语言</span>
+        <div id="langButtons" class="lang-buttons" role="group" aria-label="Language" data-i18n-aria="lang.aria">
+          <button type="button" class="lang-btn" data-lang="zh">中文</button>
+          <button type="button" class="lang-btn" data-lang="en">EN</button>
+          <button type="button" class="lang-btn" data-lang="de">DE</button>
+        </div>
+      </div>
+    </div>
+    <p class="impact-sub" data-i18n="impact.subtitle">基于德国铁路原因备注统计 + Open-Meteo 天气特征 + DB 官方事件</p>
+
+    <section class="impact-metrics" id="metricsRow" hidden aria-label="Impact overview">
+      <div class="card"><div class="lbl" data-i18n="impact.metrics.bau">施工延误占比</div><div class="val" id="mBau">-</div></div>
+      <div class="card"><div class="lbl" data-i18n="impact.metrics.wx">天气延误占比</div><div class="val" id="mWx">-</div></div>
+      <div class="card"><div class="lbl" data-i18n="impact.metrics.riskDays">天气风险日</div><div class="val" id="mRisk">-</div></div>
+      <div class="card"><div class="lbl" data-i18n="impact.metrics.maxWx">最大天气延误</div><div class="val" id="mMax">-</div></div>
+    </section>
+
+    <div id="impactBody">
+      <div class="impact-loading" data-i18n="impact.loading">加载中…</div>
+    </div>
+
+    <p class="impact-foot" id="impactFoot"></p>
+  </main>
+
+  <script src="i18n.js"></script>
+  <script src="impact.js"></script>
+</body>
+</html>

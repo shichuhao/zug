@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+ <meta charset="UTF-8" />
+ <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+ <title>列车晚点预测 · Train Delay</title>
+ <meta name="description" content="查询德国铁路车次、站点晚点历史，并预测未来列车终点和区间延误。" />
+ <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+ <link rel="stylesheet" href="style.css" />
+ <script>
+ // 防闪烁：在 CSS 应用前同步设置主题（localStorage 优先，否则跟随系统）
+ (function () {
+ try {
+ var t = localStorage.getItem('theme');
+ if (!t) {
+ t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+ }
+ document.documentElement.setAttribute('data-theme', t);
+ } catch (e) {}
+ })();
+ </script>
+</head>
+<body>
+ <div class="wrap">
+ <!-- 页面级右上角操作区：登录/历史 + 深色切换（fixed，不随 header 卡片） -->
+ <div class="top-actions">
+ <div class="user-area">
+ <span id="userInfo" class="user-info hidden"></span>
+ <button id="historyBtn" class="user-btn hidden" type="button" title="查看我的查询历史" data-i18n="btn.history">历史</button>
+ <button id="loginBtn" class="user-btn" type="button" data-i18n="btn.login">登录 / 注册</button>
+ <button id="logoutBtn" class="user-btn hidden" type="button" data-i18n="btn.logout">登出</button>
+ </div>
+ <button id="themeToggle" class="theme-toggle" type="button" title="切换深色 / 浅色模式" aria-label="切换深色 / 浅色模式" data-i18n-title="btn.themeTitle" data-i18n-aria="btn.themeTitle">🌙</button>
+ </div>
+ <header>
+ <h1 data-i18n="app.title">列车晚点预测</h1>
+ <div class="lang-area">
+ <span class="lang-label" data-i18n="lang.label">语言</span>
+ <div id="langButtons" class="lang-buttons" role="group" aria-label="Language" data-i18n-aria="lang.aria">
+ <button type="button" class="lang-btn" data-lang="zh">中文</button>
+ <button type="button" class="lang-btn" data-lang="en">EN</button>
+ <button type="button" class="lang-btn" data-lang="de">DE</button>
+ </div>
+ </div>
+ <a class="user-btn impact-link" href="/impact.html" title="施工与天气对晚点的影响" data-i18n-title="impact.title"><span data-i18n="impact.link">影响分析</span></a>
+ <p class="sub" data-i18n="app.subtitle">查询车次逐站晚点 · 预测明日终点延误</p>
+ </header>
+ <main id="main-content">
+
+ <!-- 认证结果横幅（注册/登录/登出成功提示，固定在 header 下方） -->
+ <div id="authTopMsg" class="auth-top hidden" role="status" aria-live="polite"></div>
+
+ <!-- 全局页面 Tab：单车次预测 / 行程晚点与接续预测（右侧为当前栏结果的全局分享组） -->
+ <div class="view-tabs-row">
+ <nav class="view-tabs" role="tablist" aria-label="页面切换" data-i18n-aria="nav.ariaLabel">
+ <button id="viewTabTrain" class="view-tab active" type="button" role="tab" aria-selected="true" aria-controls="viewTrain" data-i18n="nav.train">单车次预测</button>
+ <button id="viewTabRoute" class="view-tab" type="button" role="tab" aria-selected="false" aria-controls="viewRoute" data-i18n="nav.route">站对站查询</button>
+ <button id="viewTabJourney" class="view-tab" type="button" role="tab" aria-selected="false" aria-controls="viewJourney" data-i18n="nav.journey">行程晚点与接续预测</button>
+ </nav>
+ <div class="global-share">
+ <button id="shareImgQuickBtn" class="share-btn" type="button" title="生成当前栏结果图片并分享" data-i18n="share.imgQuick" data-i18n-title="share.imgQuickTitle">图片</button>
+ <button id="shareBtn" class="share-btn" title="生成分享链接" data-i18n="share.btn" data-i18n-title="share.title">分享</button>
+ </div>
+ </div>
+
+ <!-- 页面 A：单车次预测 -->
+ <div id="viewTrain" class="view-page" role="tabpanel" aria-labelledby="viewTabTrain">
+ <!-- 车次查询（车型 + 车次号 + 预测日期） -->
+ <section class="search">
+ <select id="trainType" class="type-select" title="按车型快速过滤" data-i18n-title="search.typeTitle">
+ <option value="" data-i18n="search.typeAll">车型: 全部</option>
+ <option value="RE">RE</option>
+ <option value="RB">RB</option>
+ <option value="IC">IC</option>
+ <option value="ICE">ICE</option>
+ <option value="FLX">FLX</option>
+ </select>
+ <div class="station-field search-train-field">
+ <input id="trainInput" type="text" placeholder="车次号，如 RE 11 / ICE 847 / 578" data-i18n-ph="search.placeholder" autocomplete="off" list="trainSuggest" />
+ <button id="trainClear" class="station-clear" type="button" title="清空车次号" aria-label="清空车次号" data-i18n-title="route.clearTrain" data-i18n-aria="route.clearTrain">×</button>
+ <datalist id="trainSuggest"></datalist>
+ </div>
+ <select id="predictDate" class="type-select" title="预测日期" data-i18n-title="search.dateTitle">
+ <option value="today" data-i18n="search.dateToday">今天</option>
+ <option value="tomorrow" selected data-i18n="search.dateTomorrow">明天</option>
+ <option value="day2" data-i18n="search.dateDay2">后天</option>
+ <option value="day3" data-i18n="search.dateDay3">+3 天</option>
+ <option value="day4" data-i18n="search.dateDay4">+4 天</option>
+ <option value="day5" data-i18n="search.dateDay5">+5 天</option>
+ </select>
+ <button id="searchBtn" data-i18n="search.btn">查询</button>
+ <span class="hint" data-i18n-html="search.hint">按车次查询：<code>RE 11</code>（线路所有班次） / <code>RE 62037</code>（单次列车） / <code>ICE 847</code>。</span>
+ </section>
+ <!-- 结果层宿主：#status/#predict/#results 由 app.js 按发起查询的页面挂载（页面 A 内） -->
+ <div id="trainResultsHost" class="view-results-host"></div>
+ </div><!-- /viewTrain -->
+
+ <!-- 页面 B：站对站查询（查晚点 / 查车次） -->
+ <div id="viewRoute" class="view-page hidden" role="tabpanel" aria-labelledby="viewTabRoute">
+ <!-- 站对站查询（2026-09-11 用户定稿：移除「查车次」Tab——与核心的区间
+      晚点预测无关，且与「查晚点 → 查车次」入口输出重复，后者带分组/筛选/班次号） -->
+ <section class="route-search">
+ <div id="routeTitle" class="route-title" data-i18n="route.title">站对站查询</div>
+
+ <!-- 车次号行（第一行） -->
+ <div id="routeDelayRow" class="route-delay-row">
+ <div class="station-field train-field">
+ <input id="routeDelayTrain" type="text" placeholder="车次号，如 ICE 847" data-i18n-ph="route.delayTrainPlaceholder" autocomplete="off" />
+ <button id="routeTrainClear" class="station-clear" type="button" title="清空车次号" aria-label="清空车次号" data-i18n-title="route.clearTrain" data-i18n-aria="route.clearTrain">×</button>
+ </div>
+ <button id="routeDelaySearchBtn" class="route-delay-btn" type="button" data-i18n="route.findServices">查车次</button>
+ </div>
+
+ <!-- 共享起终点 -->
+ <div class="route-row">
+ <div class="station-field">
+ <input id="fromInput" type="text" placeholder="起点站，如 München Hbf" data-i18n-ph="route.fromPlaceholder" list="stationList" autocomplete="off" />
+ <button class="station-clear" type="button" title="清空起点站" aria-label="清空起点站" data-i18n-title="route.clearFrom" data-i18n-aria="route.clearFrom">×</button>
+ </div>
+ <button id="swapBtn" class="swap-btn" title="交换起终点" aria-label="交换起终点" type="button" data-i18n-title="route.swap" data-i18n-aria="route.swap">⇄</button>
+ <div class="station-field">
+ <input id="toInput" type="text" placeholder="目的站，如 Augsburg Hbf" data-i18n-ph="route.toPlaceholder" list="stationList" autocomplete="off" />
+ <button class="station-clear" type="button" title="清空目的站" aria-label="清空目的站" data-i18n-title="route.clearTo" data-i18n-aria="route.clearTo">×</button>
+ </div>
+ </div>
+ <!-- 第二步：选定班次/确认区间后再预测 -->
+ <div id="routeDelayActionRow" class="route-delay-action-row">
+ <button id="routeDelayBtn" class="route-delay-btn" type="button" data-i18n="route.delayBtn">预测区间晚点</button>
+ </div>
+ <datalist id="stationList"></datalist>
+
+ <!-- 车次号行已上移至第一行；区间预测结果仍渲染在动态结果层 -->
+ <div id="routeDelayPane" class="route-pane" role="tabpanel" aria-labelledby="routeTitle">
+ <p class="route-delay-hint" data-i18n="route.delayHint">输入车次号 + 起终点 → 预测该车次在此区间的延误分布（如 ICE 847 从 Düsseldorf 到 Hamm）。</p>
+ <div id="routeDelayStatus" class="status hidden"></div>
+ <div id="routeDelayResult" class="route-results hidden"></div>
+ </div>
+
+ <!-- 班次列表宿主（查车次结果渲染在此，属于搜索卡片内部） -->
+ <div id="svcResultsHost"></div>
+ </section>
+ <!-- 结果层宿主：查晚点触发的区间预测结果归属本页 -->
+ <div id="routeResultsHost" class="view-results-host"></div>
+ </div><!-- /viewRoute -->
+
+ <!-- 页面 C：行程晚点与接续预测（BahnApp 行程链接分析） -->
+ <div id="viewJourney" class="view-page hidden" role="tabpanel" aria-labelledby="viewTabJourney">
+ <section class="journey-search" aria-labelledby="journeyTitle">
+ <div class="journey-title-row">
+ <div>
+ <div id="journeyTitle" class="route-title" data-i18n="journey.title">行程晚点与接续预测</div>
+ <p class="journey-lead" data-i18n="journey.lead">粘贴 BahnApp 行程链接，查看每段列车的晚点风险以及换乘赶上的概率。</p>
+ </div>
+ <button id="journeyPredictBtn" type="button" data-i18n="journey.analyze">分析行程</button>
+ </div>
+ <input id="journeyUrlInput" class="journey-url-input" type="url" placeholder="https://bahnapp.link/route/..." data-i18n-ph="journey.urlPlaceholder" autocomplete="off" />
+ <textarea id="journeyTextInput" class="journey-text-input" rows="3" placeholder="链接无法访问时，也可以粘贴行程文本（例如 RE1 (73718) From 06:12 ... To 07:50 ...）" data-i18n-ph="journey.textPlaceholder"></textarea>
+ <div id="journeyStatus" class="status hidden" role="status" aria-live="polite"></div>
+ <div id="journeyResult" class="journey-result hidden"></div>
+ </section>
+ </div><!-- /viewJourney -->
+
+ <section id="status" class="status hidden" role="alert" aria-live="assertive">
+ <span id="statusMessage"></span>
+ <button id="statusRetryBtn" class="status-retry hidden" type="button" data-i18n="btn.retry">重试</button>
+ </section>
+
+ <!-- 预测结果（新：真实数据） -->
+ <section id="predict" class="hidden">
+ <div id="predictionHead" class="p-head">
+ <span id="pTrain" class="p-train"></span>
+ <span id="pMeta" class="p-meta"></span>
+ <span id="pSource" class="p-source"></span>
+ </div>
+
+ <div id="dataQuality" class="data-quality hidden" role="status" aria-live="polite"></div>
+
+ <!-- 空数据友好提示（ICE 类无历史数据时显示） -->
+ <div id="pEmpty" class="empty-banner-wrap hidden"></div>
+
+ <!-- 线路所有班次候选（按车次查询时显示） -->
+ <div id="serviceResults" class="route-results hidden"></div>
+
+ <div id="predictionCards" class="card-grid">
+ <div class="mcard">
+ <div class="mcard-label" id="pPointLabel" data-i18n="date.tomorrow">明日点估计</div>
+ <div class="mcard-value" id="pPoint">—</div>
+ </div>
+ <div class="mcard">
+ <div class="mcard-label" data-i18n="predict.intervalLabel">P10–P90 区间</div>
+ <div class="mcard-value" id="pInterval">—</div>
+ </div>
+ <div class="mcard">
+ <div class="mcard-label" data-i18n="predict.prob15Label">P(≥15 分)</div>
+ <div class="mcard-value" id="pProb15">—</div>
+ </div>
+ <div class="mcard">
+ <div class="mcard-label" data-i18n="predict.todayLabel">今日实际</div>
+ <div class="mcard-value" id="pToday">—</div>
+ </div>
+ <div class="mcard">
+ <div class="mcard-label"><span data-i18n="predict.cancelLabel">取消概率</span><span class="mcard-exp" data-i18n="predict.cancelExp">实验</span></div>
+ <div class="mcard-value" id="pCancel">—</div>
+ </div>
+ </div>
+
+ <div id="dbStatus" class="db-banner hidden"></div>
+
+ <!-- 区间预测（直达卡片点击触发：from→to 段的延误分布） -->
+ <section id="segmentPanel" class="seg-panel hidden" aria-label="segment">
+ <div class="seg-head">
+ <h2 data-i18n="segment.title">区间预测</h2>
+ <div class="seg-route"><span id="segFrom">—</span> <span class="seg-arrow">→</span> <span id="segTo">—</span> · <span data-i18n="segment.nLabel" class="seg-n-lbl">样本</span> <span id="segN">—</span></div>
+ </div>
+ <div class="seg-metrics">
+ <div class="seg-card"><div class="lbl" data-i18n="segment.pointLabel">段中位延误</div><div class="val" id="segPoint">—</div></div>
+ <div class="seg-card"><div class="lbl">P10–P90</div><div class="val" id="segIV">—</div></div>
+ <div class="seg-card"><div class="lbl">P(≥15)</div><div class="val" id="segProb">—</div></div>
+ <div class="seg-card"><div class="lbl" data-i18n="segment.canceledLabel">取消</div><div class="val" id="segCancel">—</div></div>
+ </div>
+ <div class="seg-bar-wrap">
+ <h3 data-i18n="segment.samplesTitle">近 N 天段延误分布</h3>
+ <div class="seg-bar" id="segBar"></div>
+ </div>
+ <p class="seg-note" id="segNote"></p>
+ </section>
+
+ <!-- 晚点成分构成（按线路历史画像 + 当日叠加） -->
+<section id="breakdownPanel" class="bd-panel hidden" aria-label="breakdown">
+<div class="bd-head" id="bdHead" role="button" tabindex="0" aria-expanded="true" title="点击折叠 / 展开">
+<h2 data-i18n="breakdown.title">晚点成分构成</h2>
+<span class="bd-head-right">
+<div class="bd-meta"><span data-i18n="breakdown.dest">终点</span>: <span id="bdDest">—</span> · <span data-i18n="breakdown.region">区域</span>: <span id="bdRegion">—</span></div>
+<span class="bd-chevron" aria-hidden="true">▾</span>
+</span>
+</div>
+ <!-- 懒加载闸门：预测先出，成分分析等用户点击展开时才请求 /api/breakdown -->
+ <div id="bdLazyGate" class="bd-lazy-gate" style="display:none">
+ <button type="button" class="bd-incidents-btn" id="bdLazyBtn">
+ <span aria-hidden="true">📊</span><span data-i18n="breakdown.lazyGate">展开晚点成分分析</span>
+ </button>
+ <span class="bd-lazy-note" data-i18n="breakdown.lazyNote">预测已显示；成分分析按需加载</span>
+ </div>
+ <div class="bd-grid" id="bdGrid">
+ <div class="bd-col">
+ <h3 data-i18n="breakdown.histTitle">线路历史原因画像</h3>
+ <div class="bd-note" id="bdProfileNote" data-i18n="breakdown.histNote">按线路历史延误模式与地理特征估算（非官方逐条备注统计）</div>
+ <div class="bd-note bd-note-warn" id="bdZeroNote" style="display:none"></div>
+ <div class="bd-bar" id="bdBar" aria-label="historical breakdown bar"></div>
+ <ul class="bd-list" id="bdList"></ul>
+ <button type="button" class="bd-incidents-btn" id="bdIncidentsBtn" style="display:none">
+ <span class="bd-inc-ico">⚡</span><span data-i18n="breakdown.viewRealtime">查看实时原因 / 事件</span>
+ </button>
+ <div class="bd-incidents-box" id="bdIncidentsBox" style="display:none"></div>
+ </div>
+ <div class="bd-col">
+ <h3 data-i18n="breakdown.lineStatsTitle">线路延误特征（实测）</h3>
+ <div class="bd-note" data-i18n="breakdown.lineStatsNote">来自 PieBro 历史实际运行数据</div>
+ <div id="bdLineStats" class="bd-line-stats"></div>
+ <h3 data-i18n="breakdown.tcSectionTitle" style="margin-top:14px">原因编码实测强度</h3>
+ <div class="bd-note" data-i18n="breakdown.tcNote">来自 DB 变更接口的延误编码，含实测延误与取消率</div>
+ <div id="bdTopCodes" class="bd-top-codes"></div>
+ <h3 data-i18n="breakdown.zfTitle" style="margin-top:14px">晚点原因（可读）</h3>
+ <div class="bd-note" data-i18n="breakdown.zfNote">来自 zugfinder 730 天归档，德文原始备注</div>
+ <div id="bdZfCats" class="bd-zf-cats"></div>
+ <h3 data-i18n="breakdown.tcompSectionTitle" style="margin-top:14px">本车次原因成分实测</h3>
+ <div class="bd-note" data-i18n="breakdown.tcompNote">按该车次历史到发记录逐站统计延误编码与消息分类；样本不足时自动降级为线路画像或全网基线</div>
+ <div id="bdTrainComp" class="bd-train-comp"></div>
+ <h3 data-i18n="breakdown.todayTitle" style="margin-top:14px">今日叠加信号</h3>
+ <div class="bd-today-row"><span class="lbl" data-i18n="breakdown.weatherDelay">当日天气延误</span><span class="v" id="bdWeather">—</span></div>
+ <div class="bd-today-row"><span class="lbl" data-i18n="breakdown.constructionEvents">已知施工 / 天气事件</span><span class="v" id="bdIncCount">—</span></div>
+ <div id="bdIncList"></div>
+ </div>
+ </div>
+ </section>
+
+ <div id="chart10dPanel" class="panel">
+ <div class="panel-title" id="chart10dTitle" data-i18n="chart.10dEnd">最近 10 天 · 终点延误（分钟）</div>
+ <div class="chart-toggles">
+ <button class="toggle-btn hidden" data-metric="segment" id="metricSegmentBtn" type="button" data-i18n="predict.toggleSegment">区间到达</button>
+ <button class="toggle-btn active" data-metric="end" type="button" data-i18n="predict.toggleEnd">终点延误</button>
+ <button class="toggle-btn" data-metric="max" type="button" data-i18n="predict.toggleMax">最大延误</button>
+ <button class="toggle-btn" data-metric="station" type="button" data-i18n="predict.toggleStation">逐站延误</button>
+ <select id="stationSelect" class="station-select hidden" title="选择车站查看该站近 10 天延误" data-i18n-title="predict.stationSelectTitle"></select>
+ </div>
+ <div class="chart-box"><canvas id="chart10d" role="img" aria-label="最近 10 天延误柱状图" data-i18n-aria="predict.chart10dCanvasAria">最近 10 天延误。</canvas></div>
+ <div id="chart10dHint" class="hidden"></div>
+ </div>
+
+ <div id="chartStationsPanel" class="panel">
+ <div class="panel-title" data-i18n="predict.chart3dTitle">近 3 天 · 逐站到站延误（分钟）</div>
+ <div class="chart-box"><div class="chart-fixed-wrap"><canvas id="chartStations" role="img" aria-label="近三天逐站延误折线图" data-i18n-aria="predict.chart3dCanvasAria">近三天逐站延误曲线。</canvas></div></div>
+ <div id="chartStationsHint" class="hidden"></div>
+ <div class="chart-legend" id="stationsLegend"></div>
+ </div>
+
+ <div id="timetablePanel" class="panel">
+ <div class="panel-title"><span data-i18n="predict.timetableTitle">逐站时刻</span><span class="panel-sub" data-i18n="predict.timetableSub">近 3 个有数据的天</span></div>
+ <div class="day-tabs" id="dayTabs"></div>
+ <div id="todayTitle" class="panel-date"></div>
+ <table>
+ <thead>
+ <tr>
+ <th data-i18n="predict.th.station">车站</th>
+ <th data-i18n="predict.th.schedArr">计划到</th>
+ <th data-i18n="predict.th.arrDelay">到站延误</th>
+ <th data-i18n="predict.th.schedDep">计划发</th>
+ <th data-i18n="predict.th.depDelay">出发延误</th>
+ </tr>
+ </thead>
+ <tbody id="todayRows"></tbody>
+ </table>
+ </div>
+ </section>
+
+ <!-- 旧：模拟数据表格（/api/delay 回退） -->
+ <section id="results" class="results hidden">
+ <div class="meta">
+ <span id="metaTrain"></span>
+ <span id="metaCount" class="badge-count"></span>
+ </div>
+ <table>
+ <thead>
+ <tr>
+ <th data-i18n="results.th.train">车次</th>
+ <th data-i18n="results.th.station">车站</th>
+ <th data-i18n="results.th.sched">计划时间</th>
+ <th data-i18n="results.th.forecast">预测时间</th>
+ <th data-i18n="results.th.probe">探针时间</th>
+ <th data-i18n="results.th.delay">晚点</th>
+ <th data-i18n="results.th.status">状态</th>
+ </tr>
+ </thead>
+ <tbody id="rows"></tbody>
+ </table>
+ <div class="legend">
+ <span class="dot green"></span> <span data-i18n="legend.normal">正常 (≤5min)</span>
+ <span class="dot yellow"></span> <span data-i18n="legend.small">小延误 (5–15min)</span>
+ <span class="dot red"></span> <span data-i18n="legend.large">大延误 (>15min)</span>
+ </div>
+ </section>
+
+ <footer>
+ <p class="footer-link-row">
+ <a id="zugLink" class="zug-link hidden" target="_blank" rel="noopener" href="#">在 Zugfinder 查看该车次详情 →</a>
+ </p>
+ </footer>
+
+ <!-- 评论区（登录可发评，游客可看） -->
+ <section id="comments" class="comments">
+ <div class="comments-head">
+ <span class="comments-title" data-i18n="comments.title">评论区</span>
+ <span id="commentCount" class="comments-count"></span>
+ </div>
+ <div class="comment-composer">
+ <div class="composer-box">
+ <textarea id="commentText" class="comment-textarea" rows="2"
+ placeholder="说点什么…（登录后可发布，最长 500 字）" data-i18n-ph="comments.placeholder" maxlength="500"></textarea>
+ <div id="commentImgPreview" class="comment-img-preview hidden"></div>
+ <div class="composer-bar">
+ <button id="commentImgBtn" type="button" class="composer-icon-btn"
+ data-i18n-title="comments.attachImage" title="插入图片" aria-label="插入图片">
+ <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" focusable="false">
+ <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5v-11Z" fill="none" stroke="currentColor" stroke-width="1.6"/>
+ <circle cx="9" cy="9.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.6"/>
+ <path d="M5 17.2l4.3-4.1a1.6 1.6 0 0 1 2.2 0l2.3 2.2 1.5-1.4a1.6 1.6 0 0 1 2.2 0L20 16.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+ </svg>
+ </button>
+ <input id="commentImgInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
+ <button id="commentSubmit" class="comment-submit" type="button" data-i18n="comments.submit">发布</button>
+ </div>
+ </div>
+ </div>
+ <p id="commentMsg" class="comment-msg"></p>
+ <div id="commentList" class="comment-list"></div>
+ </section>
+ </main>
+ </div>
+ <!-- 顶部悬浮 pop-up：必须是 body 直接子元素，否则父级 display:none 会拖累 fixed 子元素不渲染 -->
+ <div id="shareTip" class="share-tip hidden"></div>
+
+ <!-- 分享弹层：链接 / 微信二维码 / WhatsApp / Telegram / 生成图片 -->
+ <div id="shareModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="分享" data-i18n-aria="share.title">
+ <div class="modal-box share-box">
+ <div class="modal-title"><span data-i18n="share.title">分享预测结果</span> <button id="shareModalClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button></div>
+ <p id="shareModalTrain" class="share-train"></p>
+ <div class="share-link-row">
+ <input id="shareLinkInput" class="share-link-input" type="text" readonly />
+ <button id="shareCopyBtn" class="share-btn" type="button" data-i18n="share.copy">复制链接</button>
+ </div>
+ <div class="share-channels">
+ <button id="shareWxBtn" class="share-channel" type="button" data-i18n="share.wx">微信</button>
+ <button id="shareWaBtn" class="share-channel" type="button" data-i18n="share.wa">WhatsApp</button>
+ <button id="shareTgBtn" class="share-channel" type="button" data-i18n="share.tg">Telegram</button>
+ </div>
+ <div id="shareWxQr" class="share-wx-qr hidden">
+ <div id="shareQrCanvas"></div>
+ <p class="share-wx-tip" data-i18n="share.wxTip">微信扫一扫，打开预测页面</p>
+ </div>
+ <div class="share-img-row">
+ <button id="shareImgBtn" class="share-btn" type="button" data-i18n="share.img">生成图片分享</button>
+ <span id="shareImgStatus" class="share-img-status"></span>
+ </div>
+ <a id="shareImgDownload" class="share-img-download hidden" download="train-delay.png" data-i18n="share.imgDownload">保存图片</a>
+ </div>
+ </div>
+
+ <!-- 登录 / 注册模态 -->
+ <div id="authModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="登录或注册" data-i18n-aria="auth.title">
+ <form id="authForm" class="modal-box">
+ <div class="modal-title"><span data-i18n="auth.title">登录 / 注册</span> <button id="authClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button></div>
+ <div class="auth-tabs">
+ <button id="tabLogin" class="auth-tab active" type="button" data-i18n="auth.tabLogin">登录</button>
+ <button id="tabRegister" class="auth-tab" type="button" data-i18n="auth.tabRegister">注册</button>
+ </div>
+ <input id="authEmail" type="email" placeholder="邮箱（如 name@example.com）" data-i18n-ph="auth.emailPlaceholder" autocomplete="email" />
+ <input id="authPassword" type="password" placeholder="密码" data-i18n-ph="auth.passwordPlaceholder" autocomplete="current-password" />
+ <p id="authMsg" class="auth-msg"></p>
+ <button id="authSubmit" class="auth-submit" type="submit" data-i18n="auth.tabLogin">登录</button>
+ <p class="auth-note" data-i18n="auth.note">注册即创建本地账号：仅邮箱 + 密码，无需邮箱验证。</p>
+ </form>
+ </div>
+
+ <!-- 查询历史面板 -->
+ <div id="historyPanel" class="history-panel hidden">
+ <div class="history-head"><span data-i18n="history.title">我的查询历史</span> <button id="historyClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button></div>
+ <div id="historyList" class="history-list"></div>
+ </div>
+
+ <!-- 历史详情弹窗 -->
+ <div id="historyDetailModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="查询详情" data-i18n-aria="history.detailTitle">
+   <div class="modal-box history-detail-box">
+     <div class="modal-title"><span data-i18n="history.detailTitle">查询详情</span> <button id="historyDetailClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button></div>
+   <div id="historyDetailBody" class="history-detail-body"></div>
+ </div>
+ </div>
+
+ <!-- 评论图片放大查看（lightbox） -->
+ <div id="commentLightbox" class="modal hidden" role="dialog" aria-modal="true" aria-label="图片查看" data-i18n-aria="comments.lightboxAria">
+   <div class="modal-box lightbox-box">
+     <button id="commentLightboxClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button>
+     <img id="commentLightboxImg" class="lightbox-img" src="" alt="">
+   </div>
+ </div>
+
+ <!-- 悬浮按钮：晚点分析（点击跳转至分析页）
+ 注意：必须位于 i18n.js/app.js <script> 之前——否则 i18n 初始化执行
+ applyI18n(document) 时此节点尚未解析，首次加载不会翻译（保持中文默认） -->
+ <a id="delayAnalysisFab" href="https://a15877246ce623b71.gz2.agentos-app.net/"
+ target="_blank" rel="noopener noreferrer"
+ style="position:fixed;right:20px;bottom:20px;z-index:9999;display:inline-flex;align-items:center;gap:8px;
+ padding:12px 18px;border-radius:999px;background:linear-gradient(135deg,#ff6a3d,#ff3d6e);
+ color:#fff;font-size:15px;font-weight:600;text-decoration:none;box-shadow:0 6px 18px rgba(255,61,110,.45);
+ cursor:pointer;transition:transform .15s ease,box-shadow .15s ease;"
+ onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 9px 24px rgba(255,61,110,.55)';"
+ onmouseout="this.style.transform='none';this.style.boxShadow='0 6px 18px rgba(255,61,110,.45)';">
+ <span style="font-size:17px;line-height:1;"></span><span class="fab-label" data-i18n="fab.delayAnalysis">晚点分析</span><span class="fab-close" role="button" aria-label="收起悬浮按钮" data-i18n-aria="fab.collapse">×</span>
+ </a>
+
+ <!-- 页脚：赞助 + 访问人数统计 -->
+ <footer id="siteFooter" class="site-footer">
+   <div class="footer-support">
+     <a id="bmcBtn" class="bmc-btn" href="https://buymeacoffee.com/mists01213g" target="_blank" rel="noopener">
+       <span class="bmc-cup" aria-hidden="true">☕</span>
+       <span data-i18n="support.buyMeCoffee">请我喝杯咖啡</span>
+     </a>
+     <button id="bmcQrBtn" class="bmc-qr-btn" type="button" data-i18n="support.scanQr">扫码赞助</button>
+   </div>
+   <div class="footer-visitors">
+     <span data-i18n="footer.visitors">访问人数</span>：<span id="visitorCount">—</span>
+   </div>
+ </footer>
+
+ <!-- Buy Me a Coffee 二维码弹窗 -->
+ <div id="bmcModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="赞助" data-i18n-aria="support.title">
+   <div class="modal-box bmc-box">
+     <div class="modal-title"><span data-i18n="support.title">请我喝杯咖啡</span> <button id="bmcModalClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button></div>
+     <p class="bmc-desc" data-i18n="support.desc">这个网站完全免费、没有广告。如果它帮到了你，欢迎请我喝杯咖啡 ☕</p>
+     <img id="bmcQrImg" class="bmc-qr-img" src="bmc-qr.png" alt="Buy Me a Coffee QR" width="240" height="240" loading="lazy" />
+     <p class="bmc-scan-hint" data-i18n="support.scanHint">用手机相机或微信扫一扫</p>
+     <a class="bmc-link-btn" href="https://buymeacoffee.com/mists01213g" target="_blank" rel="noopener" data-i18n="support.openPage">或在浏览器中打开赞助页 →</a>
+   </div>
+ </div>
+
+ <!-- Chart.js 本地优先（CDN 不可达时图表仍能渲染），失败再回退 CDN -->
+ <script src="vendor/chart.umd.js"></script>
+ <script>if(typeof Chart==="undefined"){document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"><\/script>');}</script>
+ <!-- html2canvas 图片分享 + qrcodejs 微信二维码（本地优先，CDN 兜底） -->
+ <script src="vendor/html2canvas.min.js"></script>
+ <script>if(typeof html2canvas==="undefined"){document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"><\/script>');}</script>
+ <script src="vendor/qrcode.min.js"></script>
+ <script>if(typeof QRCode==="undefined"){document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>');}</script>
+ <script src="i18n.js"></script>
+ <script src="app.js"></script>
+ <!-- 全屏查询 loading 覆盖层（查车次/预测区间晚点时显示，出结果或失败时收起） -->
+ <div id="pageLoadingOverlay" class="page-loading-overlay" style="display:none" aria-live="polite">
+ <div class="plo-box">
+ <div class="plo-spinner" aria-hidden="true"></div>
+ <div class="plo-text" id="ploText">查询中…</div>
+ <div class="plo-sub" id="ploSub"></div>
+ </div>
+ </div>
+</body>
+</html>

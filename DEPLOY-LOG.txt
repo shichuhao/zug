@@ -1,0 +1,7 @@
+[2026-09-02 07:35:54 CST] traindelay 部署公网完成
+- 公网地址: https://a7b09cb25afa46905.bj6.agentos-app.net:443/  (HTTP 200, 标题「列车晚点预测 · Train Delay」)
+- 本地: http://100.89.62.39:3000/ (Tailscale 内可达)
+- /api/delay(本地历史) /api/train(预测) 均 200
+- 平台约束: 同一时刻仅最新 release 有公网路由; traindelay(3000)当前活跃
+- WS 节点(10086/10087/10088)本地+cron+自启保活, 但公网路由被本 release 顶掉(需重发恢复)
+- 自启配置已写入 4 服务(traindelay-3000 + 3 xray)
