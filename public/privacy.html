@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>隐私说明 · 列车晚点预测</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 720px; margin: 0 auto; padding: 32px 20px 80px;
+         font: 16px/1.75 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  h1 { font-size: 1.6rem; margin-bottom: .3em; }
+  h2 { font-size: 1.1rem; margin-top: 2em; border-left: 3px solid currentColor; padding-left: .6em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .95rem; }
+  th, td { border: 1px solid rgba(128,128,128,.35); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: rgba(128,128,128,.12); }
+  code { background: rgba(128,128,128,.15); padding: 1px 5px; border-radius: 3px; font-size: .9em; }
+  a { color: inherit; }
+  .back { display: inline-block; margin-bottom: 18px; font-size: .92rem; }
+</style>
+</head>
+<body>
+<a class="back" href="/">← 返回查询</a>
+<h1>隐私说明</h1>
+<p>本页说明本站收集哪些数据、为什么收集、以及你有哪些控制权。最后更新：2026-09-18。</p>
+
+<h2>1. 我们收集什么</h2>
+<table>
+  <tr><th>数据</th><th>用途</th><th>是否必需</th></tr>
+  <tr><td>查询的车次号 / 车站</td><td>返回晚点预测结果</td><td>必需（否则无法提供服务）</td></tr>
+  <tr><td>匿名访客标识（本地随机生成）</td><td>统计独立访客数</td><td>非必需，不关联身份</td></tr>
+  <tr><td>邮箱 + 密码（仅在注册时）</td><td>登录、评论归属、查询历史同步</td><td>可选（不注册也能查询）</td></tr>
+  <tr><td>评论内容与配图</td><td>展示社区讨论</td><td>可选</td></tr>
+</table>
+
+<h2>2. 我们怎么处理</h2>
+<ul>
+  <li><strong>密码</strong>：以 scrypt 加盐哈希存储，不保存明文。</li>
+  <li><strong>评论配图</strong>：上传时自动剥离 EXIF 元数据（含 GPS 坐标、设备型号），落盘文件不含任何定位信息。</li>
+  <li><strong>分享快照</strong>：做白名单脱敏，仅保留预测展示所需字段，邮箱等身份信息一律不写入。快照 7 天后自动删除。</li>
+  <li><strong>不做</strong>：不售卖数据、不投放广告、不建立用户画像。</li>
+</ul>
+
+<h2>3. 第三方</h2>
+<ul>
+  <li>晚点数据来源于公开的德国铁路运行信息与社区数据源。</li>
+  <li>页面可能通过 CDN 加载图表等静态资源，对方会看到你的 IP（这是任意网站的通用情况）。</li>
+</ul>
+
+<h2>4. 你的控制权</h2>
+<ul>
+  <li>不注册即可使用核心查询功能。</li>
+  <li>可随时删除自己发布的评论与回复。</li>
+  <li>需要删除账号及关联数据，可通过页面底部联系方式提出。</li>
+</ul>
+
+<h2>5. Cookie 与本地存储</h2>
+<p>本站不使用追踪 Cookie。浏览器本地存储 <code>localStorage</code> 仅保存登录令牌、界面偏好（主题 / 语言 / 上次所在页）与匿名访客标识，不会发送给第三方。</p>
+
+<h2>6. 安全措施</h2>
+<ul>
+  <li>全站启用 CSP、<code>X-Frame-Options</code>、<code>X-Content-Type-Options</code> 等安全响应头。</li>
+  <li>注册、登录、评论等写接口有速率限制。</li>
+  <li>上传图片校验文件头，拒绝伪装成图片的文件。</li>
+</ul>
+
+<p style="margin-top:2.5em;opacity:.7;font-size:.9rem">本说明如有更新，会在本页注明日期。</p>
+</body>
+</html>

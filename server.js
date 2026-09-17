@@ -45,7 +45,9 @@ const DATA_FILE = path.join(ROOT, "data", "delays.json");
 const INSIGHT_SCRIPT = path.join(ROOT, "train_insight.py");
 const TIMETABLE = path.join(ROOT, "data", "timetable_re_rb.json");
 const SHARES_DIR = path.join(ROOT, "data", "shares");
-const SHARE_TTL_MS = (parseInt(process.env.SHARE_TTL_DAYS, 10) || 30) * 86400000;
+// 分享快照 TTL。QA SEC-04 建议 ≤7 天：分享链接无需鉴权，任何人拿到 id 即可读，
+// 存活越久泄露面越大。默认收到 7 天（原 30 天），可用 SHARE_TTL_DAYS 覆盖。
+const SHARE_TTL_MS = (parseInt(process.env.SHARE_TTL_DAYS, 10) || 7) * 86400000;
 // 用户 / 会话 / 查询历史（零依赖 JSON 存储）
 const USERS_FILE = path.join(ROOT, "data", "users.json");
 const SESSIONS_FILE = path.join(ROOT, "data", "sessions.json");
@@ -405,6 +407,74 @@ function writeJSONAtomic(p, obj) {
     throw e;
   }
 }
+// ===================== 速率限制（2026-09-18，QA SEC-01/SEC-02）=====================
+// QA 指出：/api/register 无速率限制 → 可暴力枚举邮箱+灌水；
+//          评论 5s 内可连发 10 条 → 反垃圾形同虚设。
+// 这里做**进程内滑动窗口**限流（零依赖、足够抵挡脚本灌水）。
+// 注意：单机内存计数在多实例部署下会失效，若将来横向扩容需换 Redis。
+const RATE_LIMITS = {
+  // route        : [窗口毫秒, 窗口内允许次数]
+  register:        [10 * 60 * 1000, 5],    // 注册：10 分钟 5 次
+  login:           [5 * 60 * 1000, 20],    // 登录：5 分钟 20 次（防撞库）
+  comment_post:    [60 * 1000, 5],         // 发评论：1 分钟 5 条
+  comment_like:    [60 * 1000, 60],        // 点赞：1 分钟 60 次（正常用户够用）
+  share_post:      [60 * 1000, 20],        // 建分享：1 分钟 20 次
+  journey_parse:   [60 * 1000, 20],        // 行程解析：1 分钟 20 次（耗外部资源）
+  train_incidents: [60 * 1000, 30],        // 实时事件：1 分钟 30 次
+};
+const _rateBuckets = new Map();
+function clientIp(req) {
+  // 部署在 nginx/tailscale 之后：优先取转发头，否则取 socket 地址
+  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  if (xf) return xf;
+  return (req.socket && (req.socket.remoteAddress || "")) || "unknown";
+}
+/**
+ * 返回 null 表示放行；否则返回 {retryAfter} 表示被限流。
+ */
+function checkRate(route, req) {
+  const conf = RATE_LIMITS[route];
+  if (!conf) return null;
+  const [winMs, max] = conf;
+  const key = route + "|" + clientIp(req);
+  const now = Date.now();
+  let arr = _rateBuckets.get(key);
+  if (!arr) { arr = []; _rateBuckets.set(key, arr); }
+  // 清掉窗口外的旧记录
+  while (arr.length && now - arr[0] > winMs) arr.shift();
+  if (arr.length >= max) {
+    return { retryAfter: Math.max(1, Math.ceil((winMs - (now - arr[0])) / 1000)) };
+  }
+  arr.push(now);
+  return null;
+}
+// 定期清理空桶，避免长期运行内存缓慢增长
+setInterval(function () {
+  const now = Date.now();
+  for (const [k, arr] of _rateBuckets) {
+    const route = k.split("|")[0];
+    const conf = RATE_LIMITS[route];
+    if (!conf) { _rateBuckets.delete(k); continue; }
+    while (arr.length && now - arr[0] > conf[0]) arr.shift();
+    if (!arr.length) _rateBuckets.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
+
+/**
+ * 限流中间件式调用：被限流时直接回 429 并返回 true（调用方应立即 return）。
+ */
+function rateLimited(res, route, req) {
+  const hit = checkRate(route, req);
+  if (!hit) return false;
+  res.setHeader("Retry-After", String(hit.retryAfter));
+  sendJSON(res, 429, {
+    error: "E_RATE_LIMITED",
+    message: "操作过于频繁，请 " + hit.retryAfter + " 秒后重试",
+    retry_after: hit.retryAfter,
+  });
+  return true;
+}
+
 // 把「写操作 catch 块」里捕获的异常正确归因（2026-09-18）。
 // 旧代码一律写成「请求体解析失败: ...」，于是 2026-09-17 存储只读时
 // 返回的是 `请求体解析失败: EROFS: read-only file system...` ——
@@ -443,13 +513,70 @@ function loadVisitors() {
 }
 function saveVisitors(v) { writeJSONAtomic(VISITORS_FILE, v); }
 // 评论配图：解析前端传来的 data URL，校验格式/体积，落盘到 COMMENT_IMG_DIR，返回可访问路径
+// ===================== 图片安全校验（2026-09-18，QA SEC-05 / LOW-07）=====================
+// QA 指出两个问题：
+//   SEC-05：评论图片直传，未做 magic bytes 校验 —— 只信 data URL 里的 MIME 声明，
+//           把 .exe 改名成 .png 再 base64 就能过。
+//   LOW-07：未剥离 EXIF —— 手机拍的图带 GPS 坐标，发一张图就暴露住址。
+// 做法：magic bytes 用纯 Node 校验（零依赖、快），EXIF 剥离交给已有的 Python(PIL)。
+const IMAGE_MAGIC = [
+  // [MIME, 文件头字节（可从 offset 0 开始匹配任一项）]
+  ["png",  [Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])]],
+  ["jpeg", [Buffer.from([0xff, 0xd8, 0xff])]],
+  ["gif",  [Buffer.from("GIF87a"), Buffer.from("GIF89a")]],
+  // webp: "RIFF"????"WEBP"
+  ["webp", [Buffer.from("RIFF")]],
+];
+function sniffImageType(buf) {
+  if (!buf || buf.length < 12) return null;
+  for (const [type, magics] of IMAGE_MAGIC) {
+    for (const m of magics) {
+      if (buf.length >= m.length && buf.slice(0, m.length).equals(m)) {
+        // webp 需再校验第 8-11 字节是 "WEBP"
+        if (type === "webp" && buf.slice(8, 12).toString("ascii") !== "WEBP") continue;
+        return type;
+      }
+    }
+  }
+  return null;
+}
+// 剥离 EXIF（含 GPS）与其它元数据。失败时原样返回（不因元数据问题拒收用户图片）。
+const EXIF_STRIP_PY = path.join(ROOT, "tools", "strip_exif.py");
+function stripExif(buf, ext, cb) {
+  if (ext === "gif") return cb(null, buf); // GIF 一般不带 EXIF，跳过省一次进程开销
+  const child = spawn(PYTHON_BIN, [EXIF_STRIP_PY], {
+    env: Object.assign({}, process.env), windowsHide: true,
+  });
+  let out = [], errOut = "";
+  let killed = false;
+  const t = setTimeout(function () { killed = true; child.kill(); }, 8000);
+  child.stdout.on("data", function (d) { out.push(d); });
+  child.stderr.on("data", function (d) { errOut += d; });
+  child.on("error", function () { clearTimeout(t); cb(null, buf); });
+  child.on("close", function (code) {
+    clearTimeout(t);
+    const res = Buffer.concat(out);
+    if (killed || code !== 0 || !res.length) {
+      if (errOut) console.error("[exif-strip] 失败，保留原图:", errOut.slice(0, 200));
+      return cb(null, buf); // 降级：剥离失败不阻断上传
+    }
+    cb(null, res);
+  });
+  child.stdin.end(buf);
+}
+
 function parseCommentImage(dataUrl) {
   if (!dataUrl) return null;
   const m = /^data:image\/(png|jpeg|jpg|gif|webp);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
   if (!m) throw new Error("图片格式不支持，请用 PNG/JPG/GIF/WebP");
   const buf = Buffer.from(m[2], "base64");
   if (buf.length > COMMENT_IMG_MAX_BYTES) throw new Error("图片过大，请控制在 3MB 以内");
-  return { ext: COMMENT_IMG_EXT[m[1]], buf: buf };
+  // 关键：不再信任 data URL 里的 MIME 声明，以文件头为准
+  const realType = sniffImageType(buf);
+  if (!realType) {
+    throw new Error("图片内容与格式不符（已拒绝），请重新导出为 PNG/JPG/GIF/WebP");
+  }
+  return { ext: COMMENT_IMG_EXT[realType], buf: buf, declared: m[1], real: realType };
 }
 function saveCommentImage(img) {
   const name = crypto.randomBytes(8).toString("hex") + "." + img.ext;
@@ -591,12 +718,14 @@ function pruneShares() {
 function saveShare(data) {
   // 2026-09-18：改为经 writeJSONAtomic 落盘，让存储只读（EROFS）被统一
   // 收敛成 StorageError(503)，而不是抛到 handler 里被误报成「请求体解析失败」。
+  // 同时做白名单脱敏：分享链接无鉴权，快照里绝不能残留任何 PII（QA SEC-04）。
   const id = crypto.randomBytes(6).toString("base64url"); // 8 字符
+  const safe = sanitizeSharePayload(data, 0) || {};
   const rec = {
     id,
     created_at: new Date().toISOString(),
-    train: (data && data.train) || "",
-    data,
+    train: (safe && safe.train) || "",
+    data: safe,
   };
   writeJSONAtomic(path.join(SHARES_DIR, id + ".json"), rec);
   return rec;
@@ -617,6 +746,52 @@ function loadShare(id) {
   } catch (_) {
     return null;
   }
+}
+
+// ===================== 分享数据脱敏（2026-09-18，QA SEC-04 / LOW-09）=====================
+// QA 指出：/api/share GET 无需鉴权，任何人拿到 id 即可读快照；
+//           若快照含用户身份信息则构成数据泄露。
+// 现状：GET 链路本来就不带 token（设计如此，分享的意义就是给别人看），
+//       所以**不能靠加鉴权解决**，正确做法是保证快照里根本不存在 PII。
+// 这里做白名单式深拷贝：只保留预测展示必需字段，其余（尤其 email / user /
+// token / visitorId 这类）一律丢弃。宁可少存，不可多存。
+const SHARE_ALLOW_KEYS = new Set([
+  "train", "line", "stations", "station_days", "days_stations",
+  "prediction", "on_time_prob", "point_estimate", "generated_at",
+  "query_date", "prediction_date", "destination", "source",
+  "breakdown", "historical", "realtime", "incidents", "summary",
+  "hourly", "daily", "days", "date", "title", "train_key",
+  // 常见嵌套容器
+  "data", "stats", "history", "segments", "rows",
+]);
+// 明确禁止的键（即便出现在白名单容器内也剔除）
+const SHARE_DENY_KEYS = /^(email|user|username|token|password|passwd|visitorId|visitor_id|ip|authorization|cookie|session|sessions|uid|userId|user_id)$/i;
+const SHARE_MAX_DEPTH = 6;
+const SHARE_MAX_STR = 500;    // 单个字符串上限（防塞日志/长文本）
+function sanitizeSharePayload(v, depth) {
+  if (depth > SHARE_MAX_DEPTH) return undefined;
+  if (v === null || v === undefined) return v;
+  if (typeof v === "string") return v.length > SHARE_MAX_STR ? v.slice(0, SHARE_MAX_STR) : v;
+  if (typeof v === "number" || typeof v === "boolean") return v;
+  if (Array.isArray(v)) {
+    const out = [];
+    for (const item of v.slice(0, 500)) {   // 数组上限，防超大载荷
+      const s = sanitizeSharePayload(item, depth + 1);
+      if (s !== undefined) out.push(s);
+    }
+    return out;
+  }
+  if (typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v)) {
+      if (SHARE_DENY_KEYS.test(k)) continue;       // 禁键优先
+      if (!SHARE_ALLOW_KEYS.has(k)) continue;      // 白名单
+      const s = sanitizeSharePayload(v[k], depth + 1);
+      if (s !== undefined) out[k] = s;
+    }
+    return out;
+  }
+  return undefined;   // function/symbol 等一律丢弃
 }
 
 const MIME = {
@@ -682,8 +857,53 @@ function queryDelay(train, limit) {
   return { train: train || "", count: rows.length, rows };
 }
 
+// ===================== 安全响应头（2026-09-18，QA SEC 项）=====================
+// QA 指出：全站没有 CSP / X-Frame-Options / Referrer-Policy。
+// 这里在响应层统一注入，保证**所有**出口（静态文件、JSON、图片）都带上，
+// 避免逐个 handler 补漏。
+//
+// CSP 设计取舍：站点用到内联 <script>/<style>（index.html 522 行全 inline），
+// 且引用 cdnjs 兜底与 buymeacoffee。若直接上严格 CSP 会白屏，
+// 故对 script/style 保留 'unsafe-inline'，但把 frame-ancestors / object-src /
+// base-uri 收死 —— 这三项才是防点击劫持与注入的关键，且不影响现有功能。
+const SECURITY_HEADERS = {
+  // 防点击劫持（QA LOW-10）
+  "X-Frame-Options": "DENY",
+  // 禁 MIME 嗅探
+  "X-Content-Type-Options": "nosniff",
+  // 外链不泄露访客来源路径（站点有 buymeacoffee 等外链）
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  // 收敛高危能力
+  // 注意（2026-09-18 实测补白名单）：以下来源是站点既有功能，漏放行会造成**功能回归**：
+  //   - cdnjs.cloudflare.com  : Chart.js / html2canvas / qrcodejs 的 CDN 兜底
+  //   - api.qrserver.com      : 分享二维码 img 兜底（'self' 会把它拦掉 → 二维码空白）
+  // 链接跳转（buymeacoffee / t.me / wa.me / agentos-app）不受 CSP 约束，无需放行。
+  "Content-Security-Policy": [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob: https://api.qrserver.com",
+    "connect-src 'self'",
+    "font-src 'self' data:",
+    "object-src 'none'",       // 禁 plugin（Flash/PDF 嵌入）
+    "base-uri 'self'",         // 防 <base> 注入改写相对路径
+    "form-action 'self'",      // 防表单外发
+    "frame-ancestors 'none'",  // 与 X-Frame-Options 双保险
+  ].join("; "),
+  // 明确禁用不需要的浏览器能力
+  "Permissions-Policy": "geolocation=(), microphone=(), camera=(), payment=()",
+};
+function applySecurityHeaders(res) {
+  try {
+    for (const k of Object.keys(SECURITY_HEADERS)) {
+      if (!res.getHeader(k)) res.setHeader(k, SECURITY_HEADERS[k]);
+    }
+  } catch (_) {}
+}
+
 function sendJSON(res, status, obj) {
   const body = JSON.stringify(obj);
+  applySecurityHeaders(res);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
@@ -1787,10 +2007,12 @@ function serveStatic(req, res, pathname) {
   }
   fs.readFile(filePath, (err, data) => {
     if (err) {
+      applySecurityHeaders(res);
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("404 Not Found");
     }
     const ext = path.extname(filePath).toLowerCase();
+    applySecurityHeaders(res);
     res.writeHead(200, {
       "Content-Type": MIME[ext] || "application/octet-stream",
       // Frontend files are deployed in place; revalidate them so a new HTML
@@ -2482,6 +2704,7 @@ function handleRequest(req, res, parsed, pathname) {
 
   // Parse a public BahnApp route into the train legs visible on its page.
   if (pathname === "/api/journey/parse" && req.method === "GET") {
+    if (rateLimited(res, "journey_parse", req)) return;
     const target = (parsed.query.url || "").trim();
     if (!target) return sendJSON(res, 400, { error: "缺少参数 url" });
     const dbJourney = parseDbFahrplanJourney(target);
@@ -2817,6 +3040,7 @@ function handleRequest(req, res, parsed, pathname) {
   // 方案：先出晚点预测（不阻塞），用户点「查看实时原因/事件」再发此请求。
   // 仅当目标日期为今天才查实时；bahn.expert 不可达/该车今日不运行 → 返回友好 error，不崩溃。
   if (pathname === "/api/train-incidents") {
+    if (rateLimited(res, "train_incidents", req)) return;
     const respond = observeRequest(req, res, pathname);
     const train = (parsed.query.train || "").trim();
     const dateIso = (parsed.query.date || "").trim();
@@ -2944,53 +3168,77 @@ function handleRequest(req, res, parsed, pathname) {
 
   // 发布评论（需登录；body 可带 train，空=首页/全局）
   if (pathname === "/api/comments" && req.method === "POST") {
+    if (rateLimited(res, "comment_post", req)) return;
     const user = getUserByToken(getToken(req));
     if (!user) return sendJSON(res, 401, { error: "请先登录再评论" });
     readBody(req, (body) => {
+      let payload;
       try {
-        const payload = JSON.parse(body || "{}");
-        if (payload.__tooLarge) {
-          return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内（可稍后重试，客户端会自动压缩）" });
-        }
-        const text = String(payload.content || "").trim();
-        let imageUrl = "";
-        try {
-          const img = parseCommentImage(payload.image);
-          if (img) imageUrl = saveCommentImage(img);
-        } catch (ie) {
-          return sendJSON(res, 400, { error: ie.message });
-        }
-        if (!text && !imageUrl) return sendJSON(res, 400, { error: "评论内容不能为空" });
-        if (text.length > COMMENT_MAX_LEN) {
-          return sendJSON(res, 400, { error: "评论最长 " + COMMENT_MAX_LEN + " 字" });
-        }
-        const trainKey = normalizeTrainKey(payload.train || "");
-        const list = readJSON(COMMENTS_FILE, []);
-        const rec = {
-          id: crypto.randomBytes(4).toString("hex"),
-          email: user.email,
-          content: text,
-          ts: new Date().toISOString(),
-          train: trainKey || "",
-          image: imageUrl,
-          likes: 0,
-          likedBy: [],
-          replies: [],
-        };
-        list.unshift(rec);
-        if (list.length > COMMENTS_LIMIT) list.length = COMMENTS_LIMIT;
-        writeJSONAtomic(COMMENTS_FILE, list);
-        return sendJSON(res, 200, {
-          comment: { id: rec.id, email: rec.email,
-                     content: rec.content, ts: rec.ts, image: rec.image || null,
-                     likes: 0, liked: false, replies: [] },
-        });
+        payload = JSON.parse(body || "{}");
       } catch (e) {
         return sendWriteError(res, e);
       }
+      if (payload && payload.__tooLarge) {
+        return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内（可稍后重试，客户端会自动压缩）" });
+      }
+      const text = String((payload && payload.content) || "").trim();
+      const rawImage = payload && payload.image;
+
+      // 落库（文本 + 图片 URL 都已就绪）
+      const commit = function (imageUrl) {
+        try {
+          if (!text && !imageUrl) return sendJSON(res, 400, { error: "评论内容不能为空" });
+          if (text.length > COMMENT_MAX_LEN) {
+            return sendJSON(res, 400, { error: "评论最长 " + COMMENT_MAX_LEN + " 字" });
+          }
+          const trainKey = normalizeTrainKey(payload.train || "");
+          const list = readJSON(COMMENTS_FILE, []);
+          const rec = {
+            id: crypto.randomBytes(4).toString("hex"),
+            email: user.email,
+            content: text,
+            ts: new Date().toISOString(),
+            train: trainKey || "",
+            image: imageUrl,
+            likes: 0,
+            likedBy: [],
+            replies: [],
+          };
+          list.unshift(rec);
+          if (list.length > COMMENTS_LIMIT) list.length = COMMENTS_LIMIT;
+          writeJSONAtomic(COMMENTS_FILE, list);
+          return sendJSON(res, 200, {
+            comment: { id: rec.id, email: rec.email,
+                       content: rec.content, ts: rec.ts, image: rec.image || null,
+                       likes: 0, liked: false, replies: [] },
+          });
+        } catch (e) {
+          return sendWriteError(res, e);
+        }
+      };
+
+      // 图片处理链（异步）：magic bytes 校验 → 剥离 EXIF/GPS → 落盘 → commit
+      let img = null;
+      try {
+        img = parseCommentImage(rawImage);
+      } catch (ie) {
+        return sendJSON(res, 400, { error: ie.message });
+      }
+      if (!img) return commit("");
+
+      stripExif(img.buf, img.ext, function (_e, cleaned) {
+        let url = "";
+        try {
+          url = saveCommentImage({ ext: img.ext, buf: cleaned || img.buf });
+        } catch (se) {
+          return sendWriteError(res, se, "图片保存失败");
+        }
+        return commit(url);
+      });
     }, COMMENT_BODY_MAX_BYTES);
     return;
   }
+
 
   // 删除评论（仅本人）
   if (pathname === "/api/comments" && req.method === "DELETE") {
@@ -3048,6 +3296,7 @@ function handleRequest(req, res, parsed, pathname) {
   {
     const m = pathname.match(/^\/api\/comments\/([^/]+)\/(like|reply)$/);
     if (m && req.method === "POST") {
+      if (rateLimited(res, "comment_like", req)) return;
       const user = getUserByToken(getToken(req));
       if (!user) return sendJSON(res, 401, { error: "请先登录" });
       const list = readJSON(COMMENTS_FILE, []);
@@ -3064,27 +3313,47 @@ function handleRequest(req, res, parsed, pathname) {
       }
       // 回复
       readBody(req, (body) => {
+        let payload;
         try {
-          const payload = JSON.parse(body || "{}");
-          if (payload.__tooLarge) {
-            return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内" });
-          }
-          const text = String(payload.content || "").trim();
-          let imageUrl = "";
-          try { const img = parseCommentImage(payload.image); if (img) imageUrl = saveCommentImage(img); }
-          catch (ie) { return sendJSON(res, 400, { error: ie.message }); }
-          if (!text && !imageUrl) return sendJSON(res, 400, { error: "回复内容不能为空" });
-          if (text.length > COMMENT_MAX_LEN) return sendJSON(res, 400, { error: "回复最长 " + COMMENT_MAX_LEN + " 字" });
-          c.replies = c.replies || [];
-          const reply = { id: crypto.randomBytes(4).toString("hex"), email: user.email, content: text, ts: new Date().toISOString(), image: imageUrl };
-          c.replies.push(reply);
-          writeJSONAtomic(COMMENTS_FILE, list);
-          return sendJSON(res, 200, { replies: c.replies.map(function (r) {
-            return { id: r.id, email: r.email, content: r.content, ts: r.ts, image: r.image || null };
-          }) });
+          payload = JSON.parse(body || "{}");
         } catch (e) {
           return sendWriteError(res, e);
         }
+        if (payload && payload.__tooLarge) {
+          return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内" });
+        }
+        const text = String((payload && payload.content) || "").trim();
+        const commitReply = function (imageUrl) {
+          try {
+            if (!text && !imageUrl) return sendJSON(res, 400, { error: "回复内容不能为空" });
+            if (text.length > COMMENT_MAX_LEN) return sendJSON(res, 400, { error: "回复最长 " + COMMENT_MAX_LEN + " 字" });
+            c.replies = c.replies || [];
+            const reply = { id: crypto.randomBytes(4).toString("hex"), email: user.email, content: text, ts: new Date().toISOString(), image: imageUrl };
+            c.replies.push(reply);
+            writeJSONAtomic(COMMENTS_FILE, list);
+            return sendJSON(res, 200, { replies: c.replies.map(function (r) {
+              return { id: r.id, email: r.email, content: r.content, ts: r.ts, image: r.image || null };
+            }) });
+          } catch (e) {
+            return sendWriteError(res, e);
+          }
+        };
+        let img = null;
+        try {
+          img = parseCommentImage(payload && payload.image);
+        } catch (ie) {
+          return sendJSON(res, 400, { error: ie.message });
+        }
+        if (!img) return commitReply("");
+        stripExif(img.buf, img.ext, function (_e, cleaned) {
+          let url = "";
+          try {
+            url = saveCommentImage({ ext: img.ext, buf: cleaned || img.buf });
+          } catch (se) {
+            return sendWriteError(res, se, "图片保存失败");
+          }
+          return commitReply(url);
+        });
       }, COMMENT_BODY_MAX_BYTES);
       return;
     }
@@ -3093,6 +3362,7 @@ function handleRequest(req, res, parsed, pathname) {
   // ===================== 用户认证 =====================
   // 注册（邮箱注册，无密码复杂度限制、无邮箱验证）
   if (pathname === "/api/register" && req.method === "POST") {
+    if (rateLimited(res, "register", req)) return;
     readBody(req, (body) => {
       try {
         const { email, password } = JSON.parse(body || "{}");
@@ -3129,6 +3399,7 @@ function handleRequest(req, res, parsed, pathname) {
 
   // 登录
   if (pathname === "/api/login" && req.method === "POST") {
+    if (rateLimited(res, "login", req)) return;
     readBody(req, (body) => {
       try {
         const { email, password } = JSON.parse(body || "{}");
@@ -3288,6 +3559,7 @@ function handleRequest(req, res, parsed, pathname) {
 
   // 保存预测快照（分享）
   if (pathname === "/api/share" && req.method === "POST") {
+    if (rateLimited(res, "share_post", req)) return;
     let body = "";
     req.on("data", (c) => {
       body += c;

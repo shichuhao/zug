@@ -1,0 +1,9 @@
+User-agent: *
+Allow: /
+# 隐私：评论配图与分享快照不应被搜索引擎索引（内含用户内容）
+Disallow: /comment_images/
+Disallow: /api/
+Disallow: /?share=
+
+# 站点地图
+Sitemap: /sitemap.xml
