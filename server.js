@@ -366,11 +366,69 @@ function readJSON(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, "utf-8")); } catch (_) { return fallback; }
 }
 
+// 数据目录可写性标志（2026-09-18 新增）。
+// 2026-09-17 的 QA 复现了「data/ 被挂成只读（EROFS）→ 写操作抛异常 →
+// 异常冒泡拖垮整个 Node 进程 → 全站 HTTP 000」的单点故障。
+// 这里统一把 FS 错误收敛成可识别的 StorageError，绝不冒泡到进程层。
+class StorageError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = "StorageError";
+    this.code = "E_STORAGE_READONLY";
+    this.status = 503;
+    this.cause = cause;
+  }
+}
+let _storageReadonly = false;
+const _storageWarned = new Set();
 function writeJSONAtomic(p, obj) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = p + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 1), "utf-8");
-  fs.renameSync(tmp, p); // 原子替换，防并发读半文件
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tmp = p + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 1), "utf-8");
+    fs.renameSync(tmp, p); // 原子替换，防并发读半文件
+    _storageReadonly = false;
+  } catch (e) {
+    const ro = e && (e.code === "EROFS" || e.code === "EACCES" || e.code === "EPERM" || e.code === "ENOSPC" || e.code === "EDQUOT");
+    if (ro) {
+      _storageReadonly = true;
+      const key = String(e.code);
+      if (!_storageWarned.has(key)) {
+        _storageWarned.add(key);
+        console.error("[storage] 数据目录不可写（" + e.code + "）：" + p +
+          " —— 写操作将返回 503，服务本身继续提供只读查询。" +
+          " 请检查挂载是否只读 / 磁盘是否写满。");
+      }
+      throw new StorageError("存储暂时不可写（" + e.code + "），请稍后重试", e);
+    }
+    // 非存储类错误（如序列化失败）原样抛出，便于定位
+    throw e;
+  }
+}
+// 把「写操作 catch 块」里捕获的异常正确归因（2026-09-18）。
+// 旧代码一律写成「请求体解析失败: ...」，于是 2026-09-17 存储只读时
+// 返回的是 `请求体解析失败: EROFS: read-only file system...` ——
+// 文案把「磁盘只读」伪装成「客户端请求格式错」，严重误导排查方向。
+function sendWriteError(res, e, fallbackMsg) {
+  if (e && e.name === "StorageError") {
+    return sendJSON(res, 503, { error: "E_STORAGE_READONLY", message: e.message });
+  }
+  return sendJSON(res, 400, { error: (fallbackMsg || "请求体解析失败") + ": " + (e && e.message) });
+}
+// 把任意 handler 抛出的错误转成响应；绝不让异常冒泡到进程层
+function failSafe(res, e, fallbackMsg) {
+  try {
+    if (e && e.name === "StorageError") {
+      return sendJSON(res, 503, { error: "E_STORAGE_READONLY", message: e.message });
+    }
+    console.error("[handler] 未捕获异常: " + (e && e.stack || e));
+    return sendJSON(res, 500, {
+      error: "E_INTERNAL",
+      message: (fallbackMsg || "服务内部错误") + (process.env.NODE_ENV === "production" ? "" : "：" + (e && e.message)),
+    });
+  } catch (_) {
+    try { res.writeHead(500); res.end(); } catch (__) {}
+  }
 }
 
 function loadUsers() { return readJSON(USERS_FILE, {}); }
@@ -394,9 +452,20 @@ function parseCommentImage(dataUrl) {
   return { ext: COMMENT_IMG_EXT[m[1]], buf: buf };
 }
 function saveCommentImage(img) {
-  try { fs.mkdirSync(COMMENT_IMG_DIR, { recursive: true }); } catch (e) {}
   const name = crypto.randomBytes(8).toString("hex") + "." + img.ext;
-  fs.writeFileSync(path.join(COMMENT_IMG_DIR, name), img.buf);
+  const dst = path.join(COMMENT_IMG_DIR, name);
+  try {
+    fs.mkdirSync(COMMENT_IMG_DIR, { recursive: true });
+    fs.writeFileSync(dst, img.buf);
+    _storageReadonly = false;
+  } catch (e) {
+    // 存储只读时给出明确归因，避免冒泡成「请求体解析失败」
+    if (e && (e.code === "EROFS" || e.code === "EACCES" || e.code === "EPERM" || e.code === "ENOSPC")) {
+      _storageReadonly = true;
+      throw new StorageError("存储暂时不可写（" + e.code + "），请稍后重试", e);
+    }
+    throw e;
+  }
   return "/comment_images/" + name;
 }
 
@@ -520,7 +589,8 @@ function pruneShares() {
 }
 
 function saveShare(data) {
-  fs.mkdirSync(SHARES_DIR, { recursive: true });
+  // 2026-09-18：改为经 writeJSONAtomic 落盘，让存储只读（EROFS）被统一
+  // 收敛成 StorageError(503)，而不是抛到 handler 里被误报成「请求体解析失败」。
   const id = crypto.randomBytes(6).toString("base64url"); // 8 字符
   const rec = {
     id,
@@ -528,8 +598,7 @@ function saveShare(data) {
     train: (data && data.train) || "",
     data,
   };
-  fs.writeFileSync(path.join(SHARES_DIR, id + ".json"),
-    JSON.stringify(rec), "utf-8");
+  writeJSONAtomic(path.join(SHARES_DIR, id + ".json"), rec);
   return rec;
 }
 
@@ -2011,6 +2080,74 @@ const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname;
 
+  // —— 全局兜底（2026-09-18）：绝不让任何 handler 异常冒泡到进程层 ——
+  // 2026-09-17 全站宕机的机制就是「一个写操作抛异常 → 未捕获 → 进程挂死」。
+  // 这里捕获同步抛出与 Promise 拒绝，保证最坏情况只挂一个请求，不挂整站。
+  try {
+    return handleRequest(req, res, parsed, pathname);
+  } catch (e) {
+    return failSafe(res, e);
+  }
+});
+
+function handleRequest(req, res, parsed, pathname) {
+  // —— 健康检查（2026-09-18 新增）——
+  // 2026-09-17 全站宕机时没有任何可用的自检端点，只能靠人工 curl 首页判断。
+  // 这里给出结构化的就绪状态：存储可写性、时刻表、预测 worker、行程代理。
+  if (pathname === "/api/health") {
+    const out = { status: "ok", time: new Date().toISOString(), checks: {} };
+    // 1) 存储可写性（关键：只读会拖垮写操作）
+    // 逐个子目录探测：只读可能只发生在 shares/ 或 comment_images/ 这类
+    // 单独挂载点上，只探 data/ 根目录会漏报（2026-09-18 实测踩到）。
+    const _probeTargets = [
+      ["data", path.join(ROOT, "data", ".health-write-probe")],
+      ["shares", path.join(SHARES_DIR, ".health-write-probe")],
+      ["comment_images", path.join(COMMENT_IMG_DIR, ".health-write-probe")],
+    ];
+    const _roParts = [];
+    let writable = true, werr = "";
+    for (const [label, probe] of _probeTargets) {
+      try {
+        fs.mkdirSync(path.dirname(probe), { recursive: true });
+        fs.writeFileSync(probe, String(Date.now()));
+        fs.unlinkSync(probe);
+      } catch (e) {
+        writable = false;
+        _roParts.push(label + "(" + (e.code || e.message) + ")");
+        werr = e.code || e.message;
+      }
+    }
+    _storageReadonly = !writable;
+    out.checks.storage = {
+      ok: writable,
+      detail: writable ? "data/ 全部可写" : ("不可写: " + _roParts.join(", ")),
+    };
+    out.checks.storage_readonly_flag = { ok: !_storageReadonly, detail: String(_storageReadonly) };
+    // 2) 时刻表
+    out.checks.timetable = { ok: !!timetable, detail: timetable ? (timetable.length + " 班次") : "未加载" };
+    // 3) 预测 worker（决定 /api/train 冷查询是 12s 还是 60s+）
+    out.checks.predictor_worker = { ok: null, detail: "未探测（见 /api/health?deep=1）" };
+    // 4) 行程抓取代理
+    out.checks.journey_proxy = {
+      ok: !!JOURNEY_SOCKS5_HOST,
+      detail: JOURNEY_SOCKS5_HOST ? (JOURNEY_SOCKS5_HOST + ":" + JOURNEY_SOCKS5_PORT) : "未配置（直连，bahnapp WAF 可能拦截）",
+    };
+    if (!writable) { out.status = "degraded"; }
+    // ?deep=1 时同步探测 worker 端口，供运维/守护脚本快速判断
+    if (parsed.query.deep === "1") {
+      try {
+        const cp = require("child_process");
+        const r = cp.execSync("ss -tlnp 2>/dev/null | grep -c ':" + (process.env.PREDICTOR_WORKER_PORT || 5099) + "\\b'", { encoding: "utf8", timeout: 3000 });
+        const n = parseInt(String(r).trim(), 10) || 0;
+        out.checks.predictor_worker = { ok: n > 0, detail: n > 0 ? "监听中" : "未监听（冷查询将走 spawn 慢路径）" };
+        if (!n) out.status = "degraded";
+      } catch (e) {
+        out.checks.predictor_worker = { ok: false, detail: "探测失败: " + e.message };
+      }
+    }
+    return sendJSON(res, out.status === "ok" ? 200 : 503, out);
+  }
+
   if (pathname === "/api/delay") {
     const train = parsed.query.train || "";
     const limitRaw = parseInt(parsed.query.limit, 10);
@@ -2382,6 +2519,17 @@ const server = http.createServer((req, res) => {
         return sendJSON(res, 422, { error: "journey_source_blocked" });
       }
       const legs = parseBahnAppJourney(html);
+      // 2026-09-18：区分「链接失效」与「解析失败」。
+      // bahnapp 的短码（/vUS2）是分享者本地会话的临时路由，重定向链为
+      //   bahnapp.link/vUS2 →302→ bahnapp.online/vUS2 →302→ bahnapp.online/route
+      // 最终落到**空白搜索页**（只有 UI 文案，无任何行程结构），解析必然失败。
+      // 旧代码一律返回 journey_parse_failed，让用户以为是自己的操作/网站 bug，
+      // 实际是链接过期 —— 必须区分，否则用户会反复重试无效链接。
+      const _emptyRoute = !legs.length && /Gib einen Startbahnhof ein|Route suchen|Verbindung suchen/i.test(text)
+                                   && text.length < 4000;
+      if (_emptyRoute) {
+        return sendJSON(res, 422, { error: "journey_link_expired" });
+      }
       // BahnApp exposes each leg as: service, origin time/station, destination time/station.
       const re = /\b((?:ICE|IC|EC|RE|RB|IR|S|U|TGV|NJ|FlixTrain)\s*\d*(?:\s*\([^)]*\))?)\s+(?:To\s+[^0-9]+?\s+)?From\s+(\d{1,2}:\d{2})\s+(.+?)\s+To\s+(\d{1,2}:\d{2})\s+(.+?)(?=\s+(?:ICE|IC|EC|RE|RB|IR|S|U|TGV|NJ|FlixTrain)\b|\s+View journey|$)/gi;
       let m;
@@ -2715,6 +2863,41 @@ const server = http.createServer((req, res) => {
       const r = findServices(line, parsed.query.time, parsed.query.types);
       recordHistory(req, { type: "services", line,
                            time: (parsed.query.time || "").trim() });
+      // 2026-09-18：空结果要给出**可行动的引导**，而不是让用户对着空面板发愣。
+      // 背景：时刻表 data/timetable_re_rb.json 是离线快照，长途车次号会随时间变化
+      // （例：同一走向的 ICE 线路，快照里叫 843，现在是 847），
+      // 因此「按车次号精确匹配」必然有查不到的情况。此时应引导用户改用
+      // 起终点/车次直达预测，而不是静默返回空数组。
+      if (!r.routes || r.routes.length === 0) {
+        const ln = normalizeLine(line);
+        // 该号查不到时，反查「同类型车型的全部可用号」，给出近似建议
+        let suggest = [];
+        try {
+          const { type: qType, num: qNum } = splitTrainLine(line);
+          if (qType && qNum && timetable) {
+            // 找出与该号「站序相似」的其他号（同一走廊线路，号段相近）
+            const nNum = parseInt(qNum, 10);
+            if (Number.isFinite(nNum)) {
+              const near = new Set();
+              for (const t of timetable) {
+                const { type: tType, num: tNum } = splitTrainLine(t.line_number);
+                if (tType !== qType) continue;
+                const tn = parseInt(tNum, 10);
+                if (!Number.isFinite(tn)) continue;
+                // 号段 ±30 内视为同一走廊候选
+                if (Math.abs(tn - nNum) <= 30) near.add(tType + " " + tNum);
+              }
+              suggest = Array.from(near).slice(0, 8);
+            }
+          }
+        } catch (_) {}
+        return sendJSON(res, 200, Object.assign({}, r, {
+          hint: "本地时刻表快照中没有该车次（长途车次号会随时间调整）。"
+              + "可直接用「车次预测」查询实时数据，或改用起终点搜索。",
+          hint_code: "services_not_in_snapshot",
+          similar_lines: suggest,
+        }));
+      }
       return sendJSON(res, 200, r);
     } catch (e) {
       return sendJSON(res, 500, { error: "查询异常: " + e.message });
@@ -2803,7 +2986,7 @@ const server = http.createServer((req, res) => {
                      likes: 0, liked: false, replies: [] },
         });
       } catch (e) {
-        return sendJSON(res, 400, { error: "请求体解析失败: " + e.message });
+        return sendWriteError(res, e);
       }
     }, COMMENT_BODY_MAX_BYTES);
     return;
@@ -2900,7 +3083,7 @@ const server = http.createServer((req, res) => {
             return { id: r.id, email: r.email, content: r.content, ts: r.ts, image: r.image || null };
           }) });
         } catch (e) {
-          return sendJSON(res, 400, { error: "请求体解析失败: " + e.message });
+          return sendWriteError(res, e);
         }
       }, COMMENT_BODY_MAX_BYTES);
       return;
@@ -2938,7 +3121,7 @@ const server = http.createServer((req, res) => {
         writeJSONAtomic(SESSIONS_FILE, sessions);
         return sendJSON(res, 200, { token, user: { email: em, created_at: users[em].created_at } });
       } catch (e) {
-        return sendJSON(res, 400, { error: "请求体解析失败: " + e.message });
+        return sendWriteError(res, e);
       }
     });
     return;
@@ -2961,7 +3144,7 @@ const server = http.createServer((req, res) => {
         writeJSONAtomic(SESSIONS_FILE, sessions);
         return sendJSON(res, 200, { token, user: { email: em, created_at: u.created_at } });
       } catch (e) {
-        return sendJSON(res, 400, { error: "请求体解析失败: " + e.message });
+        return sendWriteError(res, e);
       }
     });
     return;
@@ -3097,7 +3280,7 @@ const server = http.createServer((req, res) => {
         saveVisitors(v);
         return sendJSON(res, 200, { count: v.count });
       } catch (e) {
-        return sendJSON(res, 400, { error: "请求体解析失败" });
+        return sendWriteError(res, e);
       }
     });
     return;
@@ -3125,7 +3308,7 @@ const server = http.createServer((req, res) => {
           train: rec.train,
         });
       } catch (e) {
-        return sendJSON(res, 400, { error: "请求体解析失败: " + e.message });
+        return sendWriteError(res, e);
       }
     });
     return;
@@ -3161,7 +3344,7 @@ const server = http.createServer((req, res) => {
   }
 
   return serveStatic(req, res, pathname);
-});
+}
 
 pruneShares();
 loadTimetable();
