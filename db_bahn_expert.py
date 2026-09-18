@@ -154,6 +154,15 @@ def _rpc(procedure: str, input_obj, referer_path: str = "/"):
     """
     key = _cache_key(procedure, input_obj)
 
+    # 新鲜缓存短路：命中且在 TTL 内直接返回，避免 _throttle 等待 + 真实网络往返。
+    # 说明：本模块为每次请求 spawn 的独立进程，读缓存必须先于 _throttle()，
+    # 否则即便磁盘命中也要白等 _REQ_GAP_SEC（3.5s）。None（合法无结果）不落盘，
+    # 因此这里不会用缓存掩盖「无结果」。
+    cached, age = _cache_get(key, ttl=_CACHE_TTL_SEC)
+    if cached is not None:
+        sys.stderr.write("[bahn] %s 命中缓存（%.0fs 前），跳过网络\n" % (procedure, age))
+        return cached
+
     # 请求级冷却：该 procedure 近期连续失败，直接走缓存/报错
     if _rpc_failures.get(procedure, 0) > time.time():
         cached, age = _cache_get(key)
