@@ -2434,8 +2434,20 @@ function drawChart10d(d, metric) {
     const sd = d.station_days || [];
     title = t("chart.10dStation", { st: st ? "：" + st : "" });
     labels = sd.map((x) => x.date.slice(5));
+    // 站名归一化匹配（2026-09-18 修复）：下拉来自 d.stations（时刻表/PieBro
+    // 规范名，如 "Hamm (Westf) Hbf"、"Berlin Hauptbahnhof"），而 station_days 的
+    // 键是 zugfinder 原始站名（"Hamm(Westf)Hbf"、"Berlin Hbf"）——精确匹配会落空，
+    // 整列 null → 误报「0 天有记录」。精确失败时回退归一化匹配（normalizeStation
+    // 已剥离 Hbf/Hauptbahnhof，二者归一后一致）。
+    const stKey = normalizeStation(st);
     vals = sd.map((x) => {
-      const v = x.delays ? x.delays[st] : undefined;
+      const dl = (x && x.delays) || {};
+      let v = dl[st];
+      if ((v === undefined || v === null) && stKey) {
+        for (const k in dl) {
+          if (normalizeStation(k) === stKey) { v = dl[k]; break; }
+        }
+      }
       return v === undefined || v === null ? null : Math.max(v, 0);
     });
     dsLabel = st || t("chart.dsStation");
