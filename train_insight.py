@@ -1509,11 +1509,11 @@ def db_realtime_train(train: str, date_iso: str = "",
             return {"rows": [], "end_delay": None, "max_delay": None,
                     "error": "bahn.expert 未返回停站数据", "source": "db_realtime"}
 
-        # 权威"列车当前位置"：bahn.expert 在 journey/details 顶层给 currentStop。
-        # 注意 isRealTime 的语义陷阱（2026-09-18 实测）：
-        #   isRealTime=True 只标记**已过站**；当前站与未来站均为 False，
-        #   但它们的 arrival.delay 是有意义的（当前站=实测，未来站=预测）。
-        #   故不能用"最后一个 isRealTime 站"当位置（会差一站、少几分）。
+        # "列车当前位置"的权威来源 = 最后一个 isRealTime=True 的站（最近已通过/已出发的站）。
+        # 注意 currentStop 的语义陷阱（2026-09-18 livelist 真值验证）：
+        #   currentStop 指向**下一个未来到站**（其 arrival.time 恒 > now），并非物理当前位置；
+        #   若直接拿它的 delay 当"当前延误"，实为前方站的计划/预测值，会系统性失真。
+        #   真实当前位置 = 最后一个 isRealTime=True 的站；currentStop 仅作"全程尚无实时站"时的兜底。
         # 备选位置字段：lastKnownPosition（无 currentStop 时使用）。
         cur = det.get("currentStop") or {}
         cur_name = ((cur.get("stopPlace") or {}).get("name") or "").strip()
@@ -1527,7 +1527,7 @@ def db_realtime_train(train: str, date_iso: str = "",
         # 运行中补正：跟踪"最后一个有实时延误的站" = 列车当前位置 + 当前延误
         last_rt_delay: int | None = None
         last_rt_station = ""
-        # 站名 → (adelay, ddelay)，供 currentStop 命中时取延误（不要求 isRealTime）
+        # 站名 → (adelay, ddelay)，供兜底（currentStop/lastKnownPosition）命中时取延误
         stop_delay_map: dict[str, tuple[int | None, int | None]] = {}
         for i, s in enumerate(stops):
             sp = s.get("stopPlace") or {}
@@ -1594,22 +1594,23 @@ def db_realtime_train(train: str, date_iso: str = "",
             r.pop("_is_real_time", None)
             r.pop("_cancelled", None)
 
-        # 位置/延误：优先 currentStop（权威），回退"最后一个实时站"。
+        # 位置/延误：优先"最后一个 isRealTime 站"（真实当前位置），
+        # 回退 currentStop/lastKnownPosition（仅当全程尚无实时站，取计划延误占位）。
         # 已终到时不设 current_*（列车不在"运行中"状态）。
         cur_delay: int | None = None
         cur_station = ""
         position_source = ""
-        if not terminal_realtime and cur_name:
+        if not terminal_realtime and last_rt_delay is not None:
+            cur_delay = last_rt_delay
+            cur_station = last_rt_station
+            position_source = "last_realtime_stop"
+        if cur_delay is None and not terminal_realtime and cur_name:
             ad, dd = stop_delay_map.get(cur_name, (None, None))
             v = ad if ad is not None else dd
             if v is not None:
                 cur_delay = v
                 cur_station = cur_name
-                position_source = "currentStop"
-        if cur_delay is None and not terminal_realtime and last_rt_delay is not None:
-            cur_delay = last_rt_delay
-            cur_station = last_rt_station
-            position_source = "last_realtime_stop"
+                position_source = "currentStop_planned"
 
         if not realtime_seen:
             # 计划数据但无实时延误（列车尚未发车 / 数据延迟）→ 仍返回，但标注
@@ -1621,7 +1622,7 @@ def db_realtime_train(train: str, date_iso: str = "",
         return {"rows": rows, "end_delay": end_delay, "max_delay": mx,
                 "max_station": mx_st, "source": "db_realtime",
                 # 运行中补正字段：列车当前位置 + 当前延误
-                # position_source: currentStop（权威）/ last_realtime_stop（回退）
+                # position_source: last_realtime_stop（权威）/ currentStop_planned（兜底，计划值）
                 "current_delay": cur_delay, "current_station": cur_station,
                 "position_source": position_source}
 
