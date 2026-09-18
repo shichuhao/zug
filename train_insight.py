@@ -821,6 +821,40 @@ def _normalize_daily_trip_rows(recs: list, train: str) -> list:
     return recs
 
 
+def _today_snapshot_partial(today_row: dict | None,
+                            hist_rows_counts: list[int]) -> bool:
+    """判断「今日行」是否为**不可信/未终到**的部分快照，需要走 DB 实时补正。
+
+    背景（2026-09-18 实测 ICE 847）：zugfinder 对"今日"返回的快照可能在列车
+    运行早期生成，**只包含已开行的前若干站**（当天 7 站止于 Hamm，adelay=3；
+    完整行程 13 站至 Berlin Südkreuz）。而 `_end_delay()` 会把这条截断快照的
+    末站延误当成"终点延误"，使今日行 `end_delay` 非 None —— 旧判据
+    `end_delay is None` 因此为假，整段实时补正被跳过，页面长期停留在早上的错值。
+
+    判据（任一命中即视为 partial）：
+      - 今日行不存在，或 end_delay 为 None；
+      - 已由本函数的调用方向 db_realtime 补正过且已终到 → 不再重复抓取；
+      - 今日 rows 站数**少于历史满站数**（截断特征）。
+
+    历史满站数由调用方传入（`hist_rows_counts`），**不依赖 `stations`**：
+    `stations` 在 main() 中算出（约 2280 行）晚于本判定，存在时序倒挂。
+    """
+    if not today_row:
+        return True
+    if today_row.get("end_delay") is None:
+        return True
+    # 已用 DB 实时数据填充且已终到（end_delay 非空）→ 无需再抓
+    if (today_row.get("source") or "") == "db_realtime" \
+            and not today_row.get("_db_running"):
+        return False
+    full = max(hist_rows_counts) if hist_rows_counts else 0
+    if full >= 3:
+        n_today = len(today_row.get("rows") or [])
+        if n_today < full:
+            return True
+    return False
+
+
 def _is_day_canceled(rows: list[dict]) -> bool:
     """检测某日是否整班取消。
 
@@ -1475,12 +1509,26 @@ def db_realtime_train(train: str, date_iso: str = "",
             return {"rows": [], "end_delay": None, "max_delay": None,
                     "error": "bahn.expert 未返回停站数据", "source": "db_realtime"}
 
+        # 权威"列车当前位置"：bahn.expert 在 journey/details 顶层给 currentStop。
+        # 注意 isRealTime 的语义陷阱（2026-09-18 实测）：
+        #   isRealTime=True 只标记**已过站**；当前站与未来站均为 False，
+        #   但它们的 arrival.delay 是有意义的（当前站=实测，未来站=预测）。
+        #   故不能用"最后一个 isRealTime 站"当位置（会差一站、少几分）。
+        # 备选位置字段：lastKnownPosition（无 currentStop 时使用）。
+        cur = det.get("currentStop") or {}
+        cur_name = ((cur.get("stopPlace") or {}).get("name") or "").strip()
+        if not cur_name:
+            lkp = det.get("lastKnownPosition") or {}
+            cur_name = ((lkp.get("stopPlace") or {}).get("name") or "").strip()
+
         rows = []
         realtime_seen = False
         terminal_realtime = False  # 终点站是否已有实时数据（列车已终到/正在终点）
         # 运行中补正：跟踪"最后一个有实时延误的站" = 列车当前位置 + 当前延误
         last_rt_delay: int | None = None
         last_rt_station = ""
+        # 站名 → (adelay, ddelay)，供 currentStop 命中时取延误（不要求 isRealTime）
+        stop_delay_map: dict[str, tuple[int | None, int | None]] = {}
         for i, s in enumerate(stops):
             sp = s.get("stopPlace") or {}
             name = sp.get("name") or ""
@@ -1490,6 +1538,10 @@ def db_realtime_train(train: str, date_iso: str = "",
             ddelay = dep.get("delay")
             if adelay is not None or ddelay is not None:
                 realtime_seen = True
+            stop_delay_map[name.strip()] = (
+                int(adelay) if adelay is not None else None,
+                int(ddelay) if ddelay is not None else None,
+            )
             if arr.get("isRealTime") or dep.get("isRealTime"):
                 v = None
                 if adelay is not None:
@@ -1542,6 +1594,23 @@ def db_realtime_train(train: str, date_iso: str = "",
             r.pop("_is_real_time", None)
             r.pop("_cancelled", None)
 
+        # 位置/延误：优先 currentStop（权威），回退"最后一个实时站"。
+        # 已终到时不设 current_*（列车不在"运行中"状态）。
+        cur_delay: int | None = None
+        cur_station = ""
+        position_source = ""
+        if not terminal_realtime and cur_name:
+            ad, dd = stop_delay_map.get(cur_name, (None, None))
+            v = ad if ad is not None else dd
+            if v is not None:
+                cur_delay = v
+                cur_station = cur_name
+                position_source = "currentStop"
+        if cur_delay is None and not terminal_realtime and last_rt_delay is not None:
+            cur_delay = last_rt_delay
+            cur_station = last_rt_station
+            position_source = "last_realtime_stop"
+
         if not realtime_seen:
             # 计划数据但无实时延误（列车尚未发车 / 数据延迟）→ 仍返回，但标注
             return {"rows": rows, "end_delay": end_delay, "max_delay": mx,
@@ -1551,8 +1620,10 @@ def db_realtime_train(train: str, date_iso: str = "",
 
         return {"rows": rows, "end_delay": end_delay, "max_delay": mx,
                 "max_station": mx_st, "source": "db_realtime",
-                # 运行中补正字段：最后一个实时站的延误与站名（列车当前位置）
-                "current_delay": last_rt_delay, "current_station": last_rt_station}
+                # 运行中补正字段：列车当前位置 + 当前延误
+                # position_source: currentStop（权威）/ last_realtime_stop（回退）
+                "current_delay": cur_delay, "current_station": cur_station,
+                "position_source": position_source}
 
     except Exception as e:  # noqa: BLE001
         return {"rows": [], "end_delay": None, "max_delay": None,
@@ -1676,9 +1747,17 @@ def predict(recs: list[dict], destination: str = "") -> dict:
         fallback = False
     ends_arr = np.array(ends, dtype=float)
     if len(ends_arr) == 0:
+        # 无历史可统计。但今日若为运行中列车，仍应给出"当前延误"作为 today_actual
+        # （2026-09-18：否则历史窗口为空时运行中列车的实时值也被丢弃）。
+        _rt = next((r for r in recs if r.get("_db_current_delay") is not None), None)
+        _rt_today = _rt["_db_current_delay"] if _rt else None
+        _rt_from = _rt.get("date") if _rt else None
         return {"point_estimate": None, "p10": None, "p90": None,
                 "prob_ge15": None, "prob_ge30": None, "on_time_prob": None,
-                "today_actual": None,
+                "today_actual": _rt_today,
+                "today_actual_from": _rt_from,
+                "today_actual_is_today": bool(
+                    _rt_from and _rt_from == date.today().isoformat()),
                 "n_days": 0, "mode": mode,
                 "destination": destination or None,
                 "destination_matched_days": 0,
@@ -1693,27 +1772,44 @@ def predict(recs: list[dict], destination: str = "") -> dict:
     # "今日实际"取最近一个有数据且未取消的天（过了 0 点当天未开行时回退到上一有数据日）。
     # 运行中列车（未终到，DB 实时补充了当前延误）：优先取"当前站延误"作为今日实际，
     # 它同时会作为 current_delay 传给模型做终点预测补正（v5hr 的 delay_in_min 特征）。
+    #
+    # 显式防护（2026-09-18）：运行中的今日行 `_db_running=True` 且 end_delay 已置 None，
+    # 它不应进入 ends 统计。上面的 `v is not None` 已隐含排除，但为防其他路径残留
+    # 占位值（如截断快照的末站延误），这里显式再挡一道。
     today = None
+    today_from = None
     for r in recs:  # recs 顺序 = [今天, 历史升序...]，今天行在最前
         if r.get("_db_current_delay") is not None:
             today = r["_db_current_delay"]
+            today_from = r.get("date")
             break
     if today is None:
         for r in reversed(recs):  # 从最近历史日开始回退（历史部分升序）
             if r.get("canceled"):
+                continue
+            # 运行中行不作为"今日实际"的数据源（其 end_delay 已置 None；
+            # 若未来有路径残留占位值，这里仍显式跳过）
+            if r.get("_db_running"):
                 continue
             v = (_station_delay_from_map(r, destination)
                  if (destination and not fallback) else r.get("end_delay"))
             # v < 0（未到终点哨兵）→ 继续回退上一有数据日，不显示"准点 0"
             if v is not None and v >= 0:
                 today = v
+                today_from = r.get("date")
                 break
     today = max(today, 0.0) if today is not None else None
+    # 回退来源标记：当 today 来自历史日（非今日）时，前端应显示为"最近一次（日期）"
+    # 而非"今日实际"，避免把昨天的值冒充今天（2026-09-18 bug 的边界防护）。
+    _today_str = date.today().isoformat()
+    today_is_today = bool(today_from and today_from == _today_str)
     n_canceled = sum(1 for r in recs if r.get("canceled"))
     return {"point_estimate": round(point, 1), "p10": round(p10, 1),
             "p90": round(p90, 1), "prob_ge15": round(prob15, 4),
             "prob_ge30": round(prob30, 4), "on_time_prob": round(on_time, 4),
             "today_actual": today,
+            "today_actual_from": today_from,
+            "today_actual_is_today": today_is_today,
             "n_days": len(ends_arr), "n_canceled_days": n_canceled,
             "mode": mode,
             "destination": destination or None,
@@ -2104,8 +2200,11 @@ def main(argv: list | None = None) -> int:
                         "max_delay": None, "max_station": "", "source": "pending"})
         today_idx = 0
 
-    # 条件：今天无 end_delay（zugfinder 未返回/限流/列车未到站）→ 用 DB 实时补充
-    if recs[today_idx].get("end_delay") is None:
+    # 条件：今日行不可信/未终到（见 _today_snapshot_partial 文档）。
+    # 注意旧判据「end_delay is None」会被截断快照的末站延误骗过（2026-09-18 bug）。
+    _hist_counts = [len(r.get("rows") or []) for i, r in enumerate(recs)
+                    if i != today_idx and (r.get("rows") or [])]
+    if _today_snapshot_partial(recs[today_idx], _hist_counts):
         # 先从已有数据中提取已知站点列表（供 DB 发车板定位用）
         known_stations = []
         for r in recs:
@@ -2129,17 +2228,31 @@ def main(argv: list | None = None) -> int:
             }
         elif rt.get("current_delay") is not None:
             # 运行中且未终到：不填 end_delay（避免把"当前站延误"混入终点历史统计），
-            # 记录当前延误/位置 → 供 predict 的 today_actual 与模型补正使用
+            # 记录当前延误/位置 → 供 predict 的 today_actual 与模型补正使用。
+            # 必须**显式清掉**旧的 end_delay：截断快照会写入末站延误（如 3 分），
+            # 若残留会污染基线统计的中位数/分位数/概率（p10/p90/prob_ge15）。
             note = rt.get("note") or ""
             recs[today_idx].update({
                 "_db_running": True,
                 "_db_current_delay": rt["current_delay"],
                 "_db_current_station": rt.get("current_station", ""),
                 "rows": rt.get("rows") or [],
+                "end_delay": None,
                 "source": "db_realtime",
                 "_note": ("🔴 德铁官方实时（运行中，补正当前延误）"
                           if not note else f"🔴 德铁官方实时（{note}）"),
             })
+
+    # 今日行归一化到 recs[0]（2026-09-18 bug）：下游多处（`head = recs[0]`、
+    # `recs[0] 始终是今天`、predict 的 reversed(recs) 回退）都**假设 recs[0] 是今天**，
+    # 但 collect()/collect_multi_account() 返回的是**日期升序**（最新日在末尾）。
+    # 过去今日行 end_delay 非空、补正被跳过时，这个错位被"reversed 取最后一天"掩盖；
+    # 修复触发补正后暴露：recs[today_idx]=recs[7] 拿到实时值，但 recs[0] 仍是历史最旧日，
+    # 导致 2295 行 `head=recs[0]` 把今日行甩进 hist，recent/today_actual 全部错位。
+    if today_idx is not None and today_idx != 0 and 0 <= today_idx < len(recs):
+        _today_row = recs.pop(today_idx)
+        recs.insert(0, _today_row)
+        today_idx = 0
 
     # ── PieBro 本地历史库扩充统计窗口（核心：26 个月 parquet 免限流）──
     # zugfinder 受限流约束单次最多 8 天；基线 predict() 的中位数/分位数/概率

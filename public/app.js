@@ -1690,14 +1690,34 @@ function renderPredict(d) {
     "mcard-value" + (p15 !== null && p15 >= 0.8 ? " warn" : "");
   // 今日实际 / 运行中当前延误（补正；running 已在 pMeta 处声明）
   const todayEl = document.getElementById("pToday");
+  const todayLblEl = document.getElementById("pTodayLabel");
   const todayVal = p.today_actual;
+  const todayIsToday = p.today_actual_is_today !== false;  // 缺省视为今日（兼容旧响应）
   if (running && todayVal != null) {
+    // 运行中：显示"当前 N 分"，并在 title 里给出当前位置（不冒充终点延误）
     todayEl.textContent = t("today.running", { m: Math.round(todayVal) });
     todayEl.title = t("today.runningTitle", { station: running.current_station || "?", m: Math.round(todayVal) });
+    if (todayLblEl) {
+      todayLblEl.removeAttribute("data-i18n");
+      todayLblEl.textContent = t("predict.todayLabel");
+    }
+  } else if (todayVal != null && !todayIsToday) {
+    // 回退到历史日：明确标注日期，不冒充"今日实际"（2026-09-18 边界防护）
+    const src = p.today_actual_from || "";
+    todayEl.textContent = fmtDelay(todayVal);
+    todayEl.title = t("today.lastKnownTitle", { date: src, m: Math.round(todayVal) });
+    if (todayLblEl) {
+      todayLblEl.removeAttribute("data-i18n");
+      todayLblEl.textContent = t("today.lastKnown", { date: src });
+    }
   } else {
     todayEl.textContent =
       todayVal === null || todayVal === undefined ? "—" : fmtDelay(todayVal);
     todayEl.title = "";
+    if (todayLblEl) {
+      todayLblEl.removeAttribute("data-i18n");
+      todayLblEl.textContent = t("today.actual");
+    }
   }
   todayEl.className =
     "mcard-value" + (todayVal !== null && todayVal >= 30 ? " warn" : "");

@@ -69,6 +69,12 @@ const COMMENT_BODY_MAX_BYTES = 6 * 1024 * 1024;
 const COMMENT_IMG_EXT = { png: "png", jpeg: "jpg", jpg: "jpg", gif: "gif", webp: "webp" };
 const PREDICTION_CACHE_TTL_MS = Math.max(0, parseInt(process.env.PREDICTION_CACHE_TTL_MS, 10) || 3600000);
 const PREDICTION_CACHE_MAX_ENTRIES = Math.max(1, parseInt(process.env.PREDICTION_CACHE_MAX_ENTRIES, 10) || 100);
+// 运行中列车（响应含 `running`）的延误每分钟都在变，长 TTL 会把旧值（如早上的 3 分）
+// 一直返回给用户，让底层实时补正"修了却看不见"。对这类响应改用短 TTL：
+//   进程内缓存 90s、磁盘缓存 120s。列车终到后 running 消失，自动回到长 TTL。
+//   2026-09-18 bug：修好 train_insight 的实时补正后，UI 仍停留在旧值，即因此。
+const RUNNING_CACHE_TTL_MS = Math.max(0, parseInt(process.env.RUNNING_CACHE_TTL_MS, 10) || 90000);
+const RUNNING_DISK_CACHE_TTL_MS = Math.max(0, parseInt(process.env.RUNNING_DISK_CACHE_TTL_MS, 10) || 120000);
 const predictionCache = new Map();
 // ---- /api/train 并发合并表（2026-09-14 压测）----
 // cacheKey → { n, waiters: [respond] }。同一冷车次的并发请求共用一次 python spawn，
@@ -184,6 +190,15 @@ function getTrainDiskCache(key) {
       // 次日（或更旧）→ 失效：删文件重算
       try { fs.unlinkSync(f); } catch (_) {}
       return null;
+    }
+    // 运行中列车的今日数据是动态变化的：磁盘条目也用短 TTL 过期，避免旧值整天返回
+    // （2026-09-18 bug：运行时补正已生效，但磁盘缓存把早上的旧值继续送出）。
+    if (entry.data && entry.data.running && RUNNING_DISK_CACHE_TTL_MS) {
+      const age = Date.now() - Date.parse(entry.saved_at || 0);
+      if (!Number.isFinite(age) || age > RUNNING_DISK_CACHE_TTL_MS) {
+        try { fs.unlinkSync(f); } catch (_) {}
+        return null;
+      }
     }
     // 无 _query 回显的旧文件无法被 /api/breakdown 回放 → 视为无效，删除重算
     if (!entry.data || !entry.data._query) {
@@ -969,10 +984,13 @@ function getPredictionCache(key) {
 
 function setPredictionCache(key, data) {
   if (!PREDICTION_CACHE_TTL_MS) return;
+  // 运行中列车：延误动态变化，改用短 TTL，避免旧值滞留（见 RUNNING_CACHE_TTL_MS 注释）
+  const ttl = (data && data.running) ? RUNNING_CACHE_TTL_MS : PREDICTION_CACHE_TTL_MS;
+  if (!ttl) return;
   if (predictionCache.size >= PREDICTION_CACHE_MAX_ENTRIES) {
     predictionCache.delete(predictionCache.keys().next().value);
   }
-  predictionCache.set(key, { data, expiresAt: Date.now() + PREDICTION_CACHE_TTL_MS });
+  predictionCache.set(key, { data, expiresAt: Date.now() + ttl });
 }
 
 function recordPredictionHistory(req, data, params) {
