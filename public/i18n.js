@@ -548,6 +548,7 @@ const I18N = {
     "err.reply_empty": "回复内容不能为空",
     "err.reply_too_long": "回复最长 {{max}} 字",
     "err.reply_not_found": "回复不存在",
+    "err.history_not_found": "查询记录不存在或已被清理",
     "err.rate_limited": "操作过于频繁，请稍后再试",
     "err.storage_readonly": "存储暂时不可写，请稍后重试",
     "err.generic": "操作失败"
@@ -1085,6 +1086,7 @@ const I18N = {
     "err.reply_empty": "Reply cannot be empty",
     "err.reply_too_long": "Reply max length is {{max}} characters",
     "err.reply_not_found": "Reply not found",
+    "err.history_not_found": "History entry not found or already cleaned up",
     "err.rate_limited": "Too many requests, please try again later",
     "err.storage_readonly": "Storage temporarily read-only, please retry later",
     "err.generic": "Operation failed"
@@ -1622,6 +1624,7 @@ const I18N = {
     "err.reply_empty": "Antwort darf nicht leer sein",
     "err.reply_too_long": "Antwort max. {{max}} Zeichen",
     "err.reply_not_found": "Antwort nicht gefunden",
+    "err.history_not_found": "Verlaufseintrag nicht gefunden oder bereits gelöscht",
     "err.rate_limited": "Zu viele Anfragen, bitte später erneut versuchen",
     "err.storage_readonly": "Speicher ist vorübergehend schreibgeschützt, bitte später erneut versuchen",
     "err.generic": "Vorgang fehlgeschlagen"
@@ -1743,6 +1746,9 @@ const SERVER_ERR_CODES = {
   E_REPLY_EMPTY: "err.reply_empty",
   E_REPLY_TOO_LONG: "err.reply_too_long",
   E_REPLY_NOT_FOUND: "err.reply_not_found",
+  E_HISTORY_NOT_FOUND: "err.history_not_found",
+  E_BACKFILL_ONLY_TRAIN: "err.backfill_only_train",
+  E_BACKFILL_IN_PROGRESS: "err.backfill_in_progress",
   E_MISSING_ID: "err.missing_id",
   E_COMMENT_NOT_FOUND: "err.comment_not_found",
   E_COMMENT_NOT_OWNER: "err.comment_not_owner",

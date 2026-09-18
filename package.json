@@ -1,8 +1,11 @@
 {
-  "name": "train-delay-webapp-tests",
+  "name": "zug-train-delay",
   "private": true,
+  "description": "德国铁路晚点预测 Web 应用（Node 服务 + Python 预测 worker）",
   "scripts": {
-    "test:e2e": "node test.js"
+    "start": "node server.js",
+    "icons": "node tools/gen_icons.js",
+    "test:smoke": "node tools/e2e-smoke.js"
   },
   "devDependencies": {
     "playwright": "^1.55.0"

@@ -497,6 +497,11 @@
  <script>if(typeof QRCode==="undefined"){document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>');}</script>
  <script src="i18n.js"></script>
  <script src="app.js"></script>
+ <!-- 从 app.js 拆出的模块（QA ENG-11）：defer = 并行下载、不阻塞首屏渲染，
+      执行顺序仍按文档顺序（且在 DOM 解析完成后），与原先「同一个文件顺序执行」等价。
+      auth.js 必须先于 comments.js：comments 依赖 currentUser。 -->
+ <script defer src="auth.js"></script>
+ <script defer src="comments.js"></script>
  <!-- 全屏查询 loading 覆盖层（查车次/预测区间晚点时显示，出结果或失败时收起） -->
  <div id="pageLoadingOverlay" class="page-loading-overlay" style="display:none" aria-live="polite">
  <div class="plo-box">

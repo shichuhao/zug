@@ -1003,14 +1003,37 @@ function applySecurityHeaders(res) {
   } catch (_) {}
 }
 
+// ---- 响应 gzip（2026-09-18，QA PERF-07）----
+// /api/train 的预测响应动辄几百 KB，app.js 也有 249KB：gzip 后通常只剩 1/5，
+// 传输时间与首屏都实打实变快。只对「声明支持 gzip + 体量够大 + 文本类」的响应压缩；
+// 压缩后反而更大的（如已压缩的图片）原样发送。
+const GZIP_MIN_BYTES = 1024;
+// 文本类才压：png/jpg 本身已是压缩格式，再压纯属浪费 CPU
+const GZIP_TEXT_EXT = new Set([".html", ".js", ".css", ".json", ".svg",
+  ".txt", ".xml", ".md", ".webmanifest", ".map", ".csv"]);
+function compressBody(req, buf, compressible) {
+  if (!compressible || buf.length < GZIP_MIN_BYTES) return { body: buf, headers: {} };
+  const ae = String((req && req.headers && req.headers["accept-encoding"]) || "");
+  if (ae.indexOf("gzip") < 0) return { body: buf, headers: { Vary: "Accept-Encoding" } };
+  try {
+    const gz = zlib.gzipSync(buf, { level: 6 });
+    if (gz.length < buf.length) {
+      return { body: gz, headers: { "Content-Encoding": "gzip", "Vary": "Accept-Encoding" } };
+    }
+  } catch (_) {}
+  return { body: buf, headers: { Vary: "Accept-Encoding" } };
+}
+
 function sendJSON(res, status, obj) {
-  const body = JSON.stringify(obj);
+  const buf = Buffer.from(JSON.stringify(obj), "utf-8");
+  const c = compressBody(res._req, buf, true);
   applySecurityHeaders(res);
-  res.writeHead(status, {
+  res.writeHead(status, Object.assign({
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-  });
-  res.end(body);
+    "Content-Length": String(c.body.length),
+  }, c.headers));
+  res.end(c.body);
 }
 
 // 为耗时预测和路径查询输出可关联的单行结构化日志；响应只允许完成一次。
@@ -2118,13 +2141,15 @@ function serveStatic(req, res, pathname) {
     }
     const ext = path.extname(filePath).toLowerCase();
     applySecurityHeaders(res);
-    res.writeHead(200, {
+    const c = compressBody(req, data, GZIP_TEXT_EXT.has(ext));
+    res.writeHead(200, Object.assign({
       "Content-Type": MIME[ext] || "application/octet-stream",
       // Frontend files are deployed in place; revalidate them so a new HTML
       // structure cannot be paired with a stale app.js in the browser cache.
       "Cache-Control": [".html", ".js", ".css"].includes(ext) ? "no-cache" : "public, max-age=86400",
-    });
-    res.end(data);
+      "Content-Length": String(c.body.length),
+    }, c.headers));
+    res.end(c.body);
   });
 }
 
@@ -2406,6 +2431,8 @@ function getRideNumbers(lineQ, cb) {
 const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname;
+  // 让只拿到 res 的发送函数（sendJSON 等）也能读到请求头，用于内容协商（gzip）
+  res._req = req;
 
   // —— 全局兜底（2026-09-18）：绝不让任何 handler 异常冒泡到进程层 ——
   // 2026-09-17 全站宕机的机制就是「一个写操作抛异常 → 未捕获 → 进程挂死」。
@@ -3548,10 +3575,14 @@ function handleRequest(req, res, parsed, pathname) {
   }
 
   // 当前用户
+  // 未登录返回 200 + user:null（而非 401）：这个端点的语义是「查询当前登录态」，
+  // 页面每次加载都会调用它。返回 401 会让浏览器控制台每次留下一条红色的
+  // "Failed to load resource: 401"，把真正的错误淹没掉（QA 复测时也被这条干扰）。
+  // 需要鉴权的端点（history / comments 写操作等）仍然严格返回 401。
   if (pathname === "/api/me") {
     const user = getUserByToken(getToken(req));
-    if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
-    return sendJSON(res, 200, { user });
+    if (!user) return sendJSON(res, 200, { user: null, logged_in: false });
+    return sendJSON(res, 200, { user, logged_in: true });
   }
 
   // 查询历史（登录后可见；train 记录附带预测 vs 实际对比）
@@ -3573,12 +3604,12 @@ function handleRequest(req, res, parsed, pathname) {
       const hist = loadHistory();
       const list = hist[user.email] || [];
       const idx = list.findIndex((r) => r.id === id);
-      if (idx < 0) return sendJSON(res, 404, { error: "记录不存在" });
+      if (idx < 0) return apiFail(res, 404, "E_HISTORY_NOT_FOUND", "记录不存在");
       const rec = list[idx];
       if (rec.type !== "train") {
-        return sendJSON(res, 400, { error: "仅车次预测记录可回填实际延误" });
+        return apiFail(res, 400, "E_BACKFILL_ONLY_TRAIN", "仅车次预测记录可回填实际延误");
       }
-      if (rec._backfilling) return sendJSON(res, 409, { error: "该条正在回填中" });
+      if (rec._backfilling) return apiFail(res, 409, "E_BACKFILL_IN_PROGRESS", "该条正在回填中");
       rec._backfilling = true;
       writeJSONAtomic(HISTORY_FILE, hist);
       const child = spawn(PYTHON_BIN,
@@ -3765,6 +3796,17 @@ const WARMUP_MEM_MIN_MB = (() => {
   const v = parseInt(process.env.WARMUP_MEM_MIN_MB, 10);
   return Number.isFinite(v) && v >= 0 ? v : 6000;
 })();
+// 走常驻 worker 预热时的内存下限（默认 1200MB）。
+// 为什么两套门槛：spawn 路径每趟要 fork 一个峰值 3.4GB 的 python（加载 21MB 模型
+// + 131MB train_hist），所以门槛必须高；而常驻 worker 里模型只加载一次，
+// 预热只是一轮 HTTP 推理，内存增量可忽略。
+// 之前只有 6000MB 这一档：8GB 容器稳态已用 3.5~3.8GB（worker）+ ~1.4GB（其余常驻），
+// 余量常年低于 6000MB → 预热几乎每轮都被跳过（日志 "[warmup] 跳过本轮"），
+// 热门车次永远停在冷启动 11s —— 这正是 QA 反复测到 /api/train >5s 的根因。
+const WARMUP_MEM_MIN_MB_WORKER = (() => {
+  const v = parseInt(process.env.WARMUP_MEM_MIN_MB_WORKER, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 1200;
+})();
 let _warmupRunning = false;
 
 // 可用内存探测：优先 cgroup v2 限额，其次 /proc/meminfo。
@@ -3790,12 +3832,32 @@ function probeMemoryMB() {
   return out.availMB === null ? null : out;
 }
 
-function hasMemoryForWarmup() {
+// minMB 由调用方给定：常驻 worker 路径用低门槛，spawn 回退路径用高门槛。
+function hasMemoryForWarmup(minMB) {
+  const need = Number.isFinite(minMB) ? minMB : WARMUP_MEM_MIN_MB;
   const info = probeMemoryMB();
   if (!info || info.availMB === null) return true; // 探测不到 → 不阻断
-  // 有 cgroup 限额时要求“限额 - 已用”留够余量；否则看系统可用内存
   const budget = info.availMB;
-  return budget >= WARMUP_MEM_MIN_MB;
+  return budget >= need;
+}
+
+// 常驻 worker 是否存活（决定预热走哪条路、用哪个内存门槛）。
+// 3s 超时 + 失败即降级：预热是优化，绝不能因为探测卡住主链路。
+function workerAlive() {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    let req;
+    try {
+      const u = new URL("/health", PREDICTOR_WORKER_URL);
+      const mod = u.protocol === "https:" ? require("https") : http;
+      req = mod.request({ hostname: u.hostname, port: u.port, path: u.pathname, method: "GET" },
+        (r) => { r.resume(); finish(r.statusCode === 200); });
+    } catch (e) { return finish(false); }
+    req.setTimeout(3000, () => { try { req.destroy(); } catch (_) {} finish(false); });
+    req.on("error", () => finish(false));
+    req.end();
+  });
 }
 
 function collectHotTrains() {
@@ -3834,7 +3896,7 @@ function collectHotTrains() {
     .map((x) => x[0]);
 }
 
-function warmupOneTrain(train) {
+function warmupOneTrain(train, useWorker) {
   // ⚠️ 关键：predictDate 必须与「用户实际请求」一致，否则预热白做。
   // 前端 predictDateISO() 默认 "tomorrow" → 总会带上具体日期（如 2026-09-16），
   // 而 date 是 predictionCacheKey 的一部分。历史上这里写死 ""，导致：
@@ -3849,6 +3911,35 @@ function warmupOneTrain(train) {
     console.log("[warmup] hit  " + train);
     return Promise.resolve("hit");
   }
+  // 优先走常驻 worker：模型已在 worker 里常驻，预热只是一轮 HTTP 推理，
+  // 不再 fork 一个峰值 3.4GB 的 python。这是预热能在内存紧张环境里真正
+  // 跑起来的前提（见 WARMUP_MEM_MIN_MB_WORKER 注释）。
+  if (useWorker) {
+    return callPredictorWorker({ train, days: 8, date: predictDate,
+                                 destination: "", rideFrom: "", rideTo: "", rideTime: "" })
+      .then(function (data) {
+        if (!data || data.error) { console.warn("[warmup] worker bad " + train); return "bad"; }
+        finishWarmup(train, data, key, predictDate, "worker");
+        return "ok";
+      })
+      .catch(function (e) {
+        // worker 繁忙/不可达 → 回退 spawn（仍受 spawn 的高内存门槛保护）
+        console.warn("[warmup] worker fail " + train + ": " + (e && e.message) + " → 回退 spawn");
+        return warmupSpawn(train, predictDate, key);
+      });
+  }
+  return warmupSpawn(train, predictDate, key);
+}
+
+// 预热结果统一落盘：_query 必须与 cacheKey 对齐，否则 /api/breakdown 回放错位
+function finishWarmup(train, data, key, predictDate, via) {
+  data._query = { train, days: 8, date: predictDate, destination: "",
+                  ride_from: "", ride_to: "", ride_time: "" };
+  setTrainDiskCache(key, data);
+  console.log("[warmup] ok   " + train + " (date=" + predictDate + ", via=" + via + ")");
+}
+
+function warmupSpawn(train, predictDate, key) {
   return new Promise((resolve) => {
     const args = [INSIGHT_SCRIPT, train, "--days", "8", "--date", predictDate];
     const env = Object.assign({}, process.env);
@@ -3869,10 +3960,7 @@ function warmupOneTrain(train) {
         const data = safeJsonParse(stdout);
         if (!data || data.error) { console.warn("[warmup] bad  " + train); return resolve("bad"); }
         // _query 也要与 key 一致（date 同上），否则 /api/breakdown 回放会错位
-        data._query = { train, days: 8, date: predictDate, destination: "",
-                        ride_from: "", ride_to: "", ride_time: "" };
-        setTrainDiskCache(key, data);
-        console.log("[warmup] ok   " + train + " (date=" + predictDate + ")");
+        finishWarmup(train, data, key, predictDate, "spawn");
         resolve("ok");
       } catch (_) { resolve("parse_err"); }
     });
@@ -3882,25 +3970,29 @@ function warmupOneTrain(train) {
 async function runWarmup() {
   if (_warmupRunning) return;
   _warmupRunning = true;
-  // 内存门禁：train_insight 单进程峰值 RSS ~3.4GB。若容器/机器内存紧张，
-  // 串行预热会把预算打满并触发 OOM kill（表现为用户请求 502 + 残留僵尸进程）。
-  // 因此在每轮开始前检查可用内存，不足则跳过本轮（预热是优化，绝不能拖垮主链路）。
-  if (!hasMemoryForWarmup()) {
-    console.warn("[warmup] 跳过本轮：可用内存不足 " + WARMUP_MEM_MIN_MB + "MB");
+  // 内存门禁：spawn 路径每趟 fork 一个峰值 RSS ~3.4GB 的 python，内存紧张时
+  // 串行预热会把 cgroup 预算打满并触发 OOM kill（用户请求 502 + 残留进程）。
+  // 先探 worker：存活就走 worker 路径（模型已常驻，成本极低），门槛随之降到
+  // WARMUP_MEM_MIN_MB_WORKER；否则维持 spawn 的高门槛。
+  const workerUp = await workerAlive();
+  const memMin = workerUp ? WARMUP_MEM_MIN_MB_WORKER : WARMUP_MEM_MIN_MB;
+  if (!hasMemoryForWarmup(memMin)) {
+    console.warn("[warmup] 跳过本轮：可用内存不足 " + memMin + "MB（worker=" + (workerUp ? "up" : "down") + "）");
     _warmupRunning = false;
     return;
   }
   const _mem = probeMemoryMB();
   const list = collectHotTrains();
   console.log("[warmup] start, " + list.length + " trains: " + list.join(", ") +
+    "（via=" + (workerUp ? "worker" : "spawn") + "）" +
     (_mem && _mem.availMB !== null ? "（可用内存 " + _mem.availMB + "MB）" : ""));
   for (const t of list) {
     // 每趟前复查：前面几趟可能已把内存吃掉 → 及时收手，避免触发 OOM
-    if (!hasMemoryForWarmup()) {
-      console.warn("[warmup] 提前中止：" + t + " 之前可用内存已低于 " + WARMUP_MEM_MIN_MB + "MB");
+    if (!hasMemoryForWarmup(memMin)) {
+      console.warn("[warmup] 提前中止：" + t + " 之前可用内存已低于 " + memMin + "MB");
       break;
     }
-    try { await warmupOneTrain(t); } catch (e) { console.warn("[warmup] fail " + t + ": " + e.message); }
+    try { await warmupOneTrain(t, workerUp); } catch (e) { console.warn("[warmup] fail " + t + ": " + e.message); }
     await new Promise((r) => setTimeout(r, WARMUP_INTERVAL_MS));
   }
   _warmupRunning = false;
