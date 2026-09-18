@@ -92,6 +92,7 @@ const I18N = {
     "predict.chart10dCanvasAria": "最近 10 天延误柱状图",
     "predict.chart3dTitle": "近 3 天 · 逐站到站延误（分钟）",
     "predict.chart3dCanvasAria": "近三天逐站延误折线图",
+    "predict.chart3dCanvasAriaKbd": "近三天逐站延误折线图，按 Enter 放大查看",
     "predict.timetableTitle": "逐站时刻",
     "predict.timetableSub": "近 3 个有数据的天",
     "predict.th.station": "车站",
@@ -236,6 +237,7 @@ const I18N = {
     "status.shareSnapshot": "这是分享的预测快照，结果固定不变",
     "swap.locked": "⚠️ 该车次的起终点来自车次数据（线路为单向），不能交换。如需站对站查询反方向，请先清空车次输入框，再手动填写起终点。",
     "auth.needEmailPw": "请输入邮箱和密码",
+    "auth.pwRule": "密码需 8–128 位，且同时包含字母和数字",
     "auth.fail": "操作失败，请重试",
     "auth.registerOk": "注册成功：",
     "auth.loginOk": "已登录：",
@@ -542,6 +544,12 @@ const I18N = {
     "err.queryFailRaw": "查询失败",
     "err.tooLarge": "请求内容过大，请精简后重试",
     "err.slowKept": "查询较慢，已保留上一次结果，可点击重试",
+    "err.password_weak": "密码需 8–128 位，且同时包含字母和数字",
+    "err.reply_empty": "回复内容不能为空",
+    "err.reply_too_long": "回复最长 {{max}} 字",
+    "err.reply_not_found": "回复不存在",
+    "err.rate_limited": "操作过于频繁，请稍后再试",
+    "err.storage_readonly": "存储暂时不可写，请稍后重试",
     "err.generic": "操作失败"
   },
 
@@ -622,6 +630,7 @@ const I18N = {
     "predict.chart10dCanvasAria": "Bar chart of delays over the last 10 days",
     "predict.chart3dTitle": "Last 3 days · per-station arrival delay (minutes)",
     "predict.chart3dCanvasAria": "Line chart of per-station delay over the last 3 days",
+    "predict.chart3dCanvasAriaKbd": "Line chart of per-station delay over the last 3 days, press Enter to enlarge",
     "predict.timetableTitle": "Per-station timetable",
     "predict.timetableSub": "Last 3 days with data",
     "predict.th.station": "Station",
@@ -765,6 +774,7 @@ const I18N = {
     "status.shareSnapshot": "This is a shared prediction snapshot, results are fixed",
     "swap.locked": "⚠️ This train's origin/destination come from train data (the line is one-way) and cannot be swapped. For the reverse direction, clear the train input first, then fill origin/destination manually.",
     "auth.needEmailPw": "Please enter email and password",
+    "auth.pwRule": "Password must be 8–128 chars, with letters and digits",
     "auth.fail": "Operation failed, please retry",
     "auth.registerOk": "Registered: ",
     "auth.loginOk": "Logged in: ",
@@ -1071,6 +1081,12 @@ const I18N = {
     "err.queryFailRaw": "Query failed",
     "err.tooLarge": "Request payload too large, please trim it and retry",
     "err.slowKept": "The query is slow — showing the previous result. You can retry.",
+    "err.password_weak": "Password must be 8–128 chars, with letters and digits",
+    "err.reply_empty": "Reply cannot be empty",
+    "err.reply_too_long": "Reply max length is {{max}} characters",
+    "err.reply_not_found": "Reply not found",
+    "err.rate_limited": "Too many requests, please try again later",
+    "err.storage_readonly": "Storage temporarily read-only, please retry later",
     "err.generic": "Operation failed"
   },
 
@@ -1151,6 +1167,7 @@ const I18N = {
     "predict.chart10dCanvasAria": "Balkendiagramm der Verspätungen der letzten 10 Tage",
     "predict.chart3dTitle": "Letzte 3 Tage · Verspätung pro Halt (Minuten)",
     "predict.chart3dCanvasAria": "Liniendiagramm der Haltverspätung der letzten 3 Tage",
+    "predict.chart3dCanvasAriaKbd": "Liniendiagramm der Haltverspätung der letzten 3 Tage, Enter zum Vergrößern",
     "predict.timetableTitle": "Fahrplan pro Halt",
     "predict.timetableSub": "Letzte 3 Tage mit Daten",
     "predict.th.station": "Bahnhof",
@@ -1294,6 +1311,7 @@ const I18N = {
     "status.shareSnapshot": "Dies ist ein geteiltes Prognose-Snapshot, Ergebnisse sind fest",
     "swap.locked": "⚠️ Start/Ziel dieses Zugs stammen aus den Zugdaten (Linie ist Einbahnstraße) und können nicht getauscht werden. Für die Gegenrichtung zuerst das Zugfeld leeren, dann Start/Ziel manuell eingeben.",
     "auth.needEmailPw": "Bitte E-Mail und Passwort eingeben",
+    "auth.pwRule": "Passwort: 8–128 Zeichen, mit Buchstaben und Zahlen",
     "auth.fail": "Vorgang fehlgeschlagen, bitte erneut versuchen",
     "auth.registerOk": "Registriert: ",
     "auth.loginOk": "Angemeldet: ",
@@ -1600,6 +1618,12 @@ const I18N = {
     "err.queryFailRaw": "Abfrage fehlgeschlagen",
     "err.tooLarge": "Anfrageinhalt zu groß, bitte kürzen und erneut versuchen",
     "err.slowKept": "Die Abfrage ist langsam – vorheriges Ergebnis wird beibehalten. Erneut versuchen möglich.",
+    "err.password_weak": "Passwort: 8–128 Zeichen, mit Buchstaben und Zahlen",
+    "err.reply_empty": "Antwort darf nicht leer sein",
+    "err.reply_too_long": "Antwort max. {{max}} Zeichen",
+    "err.reply_not_found": "Antwort nicht gefunden",
+    "err.rate_limited": "Zu viele Anfragen, bitte später erneut versuchen",
+    "err.storage_readonly": "Speicher ist vorübergehend schreibgeschützt, bitte später erneut versuchen",
     "err.generic": "Vorgang fehlgeschlagen"
   }
 };
@@ -1701,6 +1725,33 @@ function applyI18n(root) {
 
 // 服务器错误本地化：把服务器返回的中文 error 串映射为当前语言
 // data-i18n 风格：精确匹配或最长前缀匹配（前缀命中的部分作为 detail 追加）
+// 服务端错误码 → i18n key（2026-09-18，QA FUNC-09）
+// 服务端 error 字段已统一为稳定错误码（E_XXX），前端按码查表：
+// 文案怎么改、当前语言是什么，都不影响映射命中。
+const SERVER_ERR_CODES = {
+  E_BAD_EMAIL: "err.bad_email",
+  E_PASSWORD_EMPTY: "err.password_empty",
+  E_PASSWORD_TOO_SHORT: "err.password_weak",
+  E_PASSWORD_TOO_LONG: "err.password_weak",
+  E_PASSWORD_WEAK: "err.password_weak",
+  E_EMAIL_TAKEN: "err.email_registered",
+  E_BAD_CREDENTIALS: "err.bad_creds",
+  E_NOT_LOGGED_IN: "err.not_logged_in",
+  E_LOGIN_REQUIRED: "err.login_required_comment",
+  E_COMMENT_EMPTY: "err.comment_empty",
+  E_COMMENT_TOO_LONG: "err.comment_too_long",
+  E_REPLY_EMPTY: "err.reply_empty",
+  E_REPLY_TOO_LONG: "err.reply_too_long",
+  E_REPLY_NOT_FOUND: "err.reply_not_found",
+  E_MISSING_ID: "err.missing_id",
+  E_COMMENT_NOT_FOUND: "err.comment_not_found",
+  E_COMMENT_NOT_OWNER: "err.comment_not_owner",
+  E_SHARE_MISSING_TRAIN: "err.share_missing",
+  E_SHARE_NOT_FOUND: "err.share_not_found",
+  E_RATE_LIMITED: "err.rate_limited",
+  E_STORAGE_READONLY: "err.storage_readonly",
+  E_INTERNAL: "err.generic",
+};
 const SERVER_ERR_MAP = {
   "缺少参数 train": "err.missing_train",
   "预测服务异常": "err.predict_spawn",
@@ -1743,6 +1794,10 @@ const SERVER_ERR_MAP = {
 };
 function localErrStr(s) {
   if (!s) return t("err.generic");
+  // 稳定错误码优先命中：不受服务端中文文案改动影响
+  if (typeof s === "string" && s.indexOf("E_") === 0 && SERVER_ERR_CODES[s]) {
+    return t(SERVER_ERR_CODES[s]);
+  }
   if (SERVER_ERR_MAP[s]) return t(SERVER_ERR_MAP[s]);
   // 最长前缀匹配
   let bestKey = null, bestLen = 0;

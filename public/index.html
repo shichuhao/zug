@@ -6,6 +6,9 @@
  <title>列车晚点预测 · Train Delay</title>
  <meta name="description" content="查询德国铁路车次、站点晚点历史，并预测未来列车终点和区间延误。" />
  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+ <link rel="manifest" href="/manifest.json" />
+ <meta name="theme-color" content="#2563eb" />
+ <link rel="apple-touch-icon" href="/icon-192.png" />
  <link rel="stylesheet" href="style.css" />
  <script>
  // 防闪烁：在 CSS 应用前同步设置主题（localStorage 优先，否则跟随系统）
@@ -289,7 +292,7 @@
 
  <div id="chartStationsPanel" class="panel">
  <div class="panel-title" data-i18n="predict.chart3dTitle">近 3 天 · 逐站到站延误（分钟）</div>
- <div class="chart-box"><div class="chart-fixed-wrap"><canvas id="chartStations" role="img" aria-label="近三天逐站延误折线图" data-i18n-aria="predict.chart3dCanvasAria">近三天逐站延误曲线。</canvas></div></div>
+ <div class="chart-box"><div class="chart-fixed-wrap"><canvas id="chartStations" role="img" tabindex="0" aria-label="近三天逐站延误折线图，按 Enter 放大查看" data-i18n-aria="predict.chart3dCanvasAriaKbd">近三天逐站延误曲线。</canvas></div></div>
  <div id="chartStationsHint" class="hidden"></div>
  <div class="chart-legend" id="stationsLegend"></div>
  </div>

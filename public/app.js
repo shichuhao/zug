@@ -2719,6 +2719,18 @@ function drawStations(d) {
       spanGaps: false,
     });
   });
+  // QA ENG-13：canvas 默认不进 Tab 序列，键盘用户无法触发放大交互。
+  // canvas 已带 tabindex=0（index.html），这里补 Enter/Space 触发，与点击等价；
+  // 关闭 lightbox 时焦点会由 closeChartLightbox 返回到触发元素（已有逻辑）。
+  if (el && !el._kbdLightboxBound) {
+    el._kbdLightboxBound = true;
+    el.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+        ev.preventDefault();
+        openChartLightbox(chartStations, stations, d);
+      }
+    });
+  }
   chartStations = new Chart(el, {
     type: "line",
     // responsive:true —— 尺寸由外层 .chart-fixed-wrap 的固定宽度主导
@@ -3017,12 +3029,13 @@ function delayCls(v) {
 /* ========== 站对站查询（五车型） ========== */
 
 // JSON 请求统一处理超时、调用方取消和响应格式错误；自动携带登录 token。
+// 会话凭证已改为 httpOnly Cookie（2026-09-18，QA SEC-03）：
+// token 不再写入 localStorage —— JS 读不到 Cookie，XSS 偷不走会话；
+// 浏览器会自动随同源请求带上，前端不需要也不应该手动拼 header。
+// 这里保留函数签名（返回空对象）以兼容既有调用点；
+// 服务端仍接受 Authorization: Bearer，仅供脚本/curl 调试使用。
 function authHeaders() {
-  try {
-    // 变量原名 t，遮蔽全局 i18n 函数 t()。此处暂未踩坑，但保持全站无遮蔽。
-    var token = localStorage.getItem("td_token");
-    return token ? { "Authorization": "Bearer " + token } : {};
-  } catch (e) { return {}; }
+  return {};
 }
 async function fetchJSON(url, opts) {
   var opt = opts || {};
@@ -3040,7 +3053,8 @@ async function fetchJSON(url, opts) {
     controller.abort();
   }, opt.timeout || DEFAULT_REQUEST_TIMEOUT_MS);
   try {
-    var resp = await fetch(url, Object.assign({}, opt, { headers: headers, signal: controller.signal }));
+    // credentials: "same-origin" —— 让 httpOnly 会话 Cookie 随请求发出（登录态的关键）
+    var resp = await fetch(url, Object.assign({}, opt, { headers: headers, signal: controller.signal, credentials: "same-origin" }));
     if (!resp.ok) {
       var httpError = new Error();
       httpError.status = resp.status;
@@ -4171,6 +4185,12 @@ function closeAuth() {
   }
 }
 
+// 密码强度规则：与服务端 PASSWORD_RULE_MSG 保持一致（8–128 位 + 字母 + 数字）
+function passwordStrong(pw) {
+  var s = String(pw || "");
+  return s.length >= 8 && s.length <= 128 && /[A-Za-z]/.test(s) && /[0-9]/.test(s);
+}
+
 function syncAuthTabs() {
   var tabLogin = document.getElementById("tabLogin");
   var tabReg = document.getElementById("tabRegister");
@@ -4189,12 +4209,18 @@ async function submitAuth() {
     showAuthMsg(t("auth.needEmailPw"), true);
     return;
   }
+  // 前端预校验密码强度（服务端还有一层硬校验，这里只是把反馈提前到输入阶段）
+  if (authTab === "register" && !passwordStrong(pw)) {
+    showAuthMsg(t("auth.pwRule"), true);
+    return;
+  }
   var submit = document.getElementById("authSubmit");
   if (submit) submit.disabled = true;
   try {
     var resp = await fetch(authTab === "login" ? "/api/login" : "/api/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",   // 接收并保存 httpOnly 会话 Cookie
       body: JSON.stringify({ email: email, password: pw })
     });
     var data = null;
@@ -4203,7 +4229,9 @@ async function submitAuth() {
       showAuthMsg((data && data.error) ? localErrStr(data.error) : t("auth.fail"), true);
       return;
     }
-    try { localStorage.setItem(AUTH_TOKEN_KEY, data.token); } catch (e) {}
+    // 会话已在 httpOnly Cookie 中，前端不再持有 token。
+    // 顺手清掉旧版本遗留在 localStorage 里的 token（历史上写过 td_token）。
+    try { localStorage.removeItem(AUTH_TOKEN_KEY); } catch (e) {}
     closeAuth();
     updateAuthUI(data.user);
     showAuthTopMsg(authTab === "register" ? t("auth.registerOk") + data.user.email : t("auth.loginOk") + data.user.email, false);
@@ -4215,7 +4243,7 @@ async function submitAuth() {
 }
 
 function logout() {
-  fetch("/api/logout", { method: "POST", headers: authHeaders() }).catch(function () {});
+  fetch("/api/logout", { method: "POST", headers: authHeaders(), credentials: "same-origin" }).catch(function () {});
   try { localStorage.removeItem(AUTH_TOKEN_KEY); } catch (e) {}
   updateAuthUI(null);
   closeHistory();
@@ -4446,30 +4474,36 @@ function openCommentLightbox(src) {
   var modal = document.getElementById("commentLightbox");
   var img = document.getElementById("commentLightboxImg");
   if (!modal || !img) return;
+  // QA ENG-15：记录触发元素，关闭时把焦点还回去（键盘/读屏用户不会"掉"到 body）
+  modal._returnFocus = (document.activeElement instanceof HTMLElement) ? document.activeElement : null;
   img.src = src || "";
   modal.classList.remove("hidden");
+  var closeBtn = document.getElementById("commentLightboxClose");
+  if (closeBtn) closeBtn.focus();
 }
 function closeCommentLightbox() {
   var modal = document.getElementById("commentLightbox");
-  if (modal) modal.classList.add("hidden");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  var rf = modal._returnFocus;
+  if (rf && document.contains(rf)) { try { rf.focus(); } catch (e) {} }
+  modal._returnFocus = null;
 }
 
 /* ---------- 初始化 ---------- */
 
 function initAuth() {
-  var token = authHeaders().Authorization;
-  if (token) {
-    fetchJSON("/api/me").then(function (d) {
-      if (d && d.user) {
-        updateAuthUI(d.user);
-      } else {
-        try { localStorage.removeItem(AUTH_TOKEN_KEY); } catch (e) {}
-        updateAuthUI(null);
-      }
-    });
-  } else {
+  // 会话改由 httpOnly Cookie 承载，前端看不到 token 是否存在，
+  // 只能问一次服务端：已登录则渲染用户信息，否则渲染未登录态。
+  fetchJSON("/api/me").then(function (d) {
+    if (d && d.user) {
+      updateAuthUI(d.user);
+    } else {
+      updateAuthUI(null);
+    }
+  }).catch(function () {
     updateAuthUI(null);
-  }
+  });
 
   var loginBtn = document.getElementById("loginBtn");
   if (loginBtn) loginBtn.addEventListener("click", function () { openAuth("login"); });

@@ -617,11 +617,93 @@ function hashPassword(pw, salt) {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// 从请求提取 Bearer token
+// ---- 密码强度（2026-09-18，QA SEC-02）----
+// 原先密码 "123" 也能注册成功，弱口令等于把账号拱手让人。
+// 这里做服务端硬校验：长度 8–128，且必须同时含字母与数字。
+// （前端也要校验，但服务端这层才是唯一可信的。）
+const PW_MIN_LEN = 8;
+const PW_MAX_LEN = 128;   // 上限防 scrypt 被超长串拖成 CPU DoS
+const PASSWORD_RULE_MSG = "密码需 8–128 位，且同时包含字母和数字";
+function passwordIssue(pw) {
+  const s = (pw === undefined || pw === null) ? "" : String(pw);
+  if (!s) return "E_PASSWORD_EMPTY";
+  if (s.length < PW_MIN_LEN) return "E_PASSWORD_TOO_SHORT";
+  if (s.length > PW_MAX_LEN) return "E_PASSWORD_TOO_LONG";
+  if (!/[A-Za-z]/.test(s) || !/[0-9]/.test(s)) return "E_PASSWORD_WEAK";
+  return null;
+}
+
+// ---- 统一错误码（2026-09-18，QA FUNC-09）----
+// 旧写法把中文文案直接塞进 error 字段，前端只能拿中文串做 i18n 匹配，
+// 一旦文案改一个字映射就断。改为：error 恒为稳定错误码，message 为中文兜底。
+// 前端 localErrStr() 优先按错误码查表，查不到再回退中文串匹配/直出。
+// code 用于前端 i18n，zh 为服务端默认文案（前端不可用时也能读）
+// 取第一个「已定义且非空串」的参数（用于接口字段别名兼容）
+function firstDefined() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = arguments[i];
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return undefined;
+}
+
+function apiFail(res, status, code, zh) {
+  return sendJSON(res, status, { error: code, message: zh || code });
+}
+
+// ---- 会话 Cookie（2026-09-18，QA SEC-03）----
+// token 原先只走 Authorization: Bearer，前端被迫存 localStorage，
+// 一旦有 XSS 就能被整包偷走。改为 httpOnly Cookie 为主通道：
+// JS 读不到 Cookie，XSS 拿不到 token；浏览器自动携带，前端代码零负担。
+// Authorization 仍保留作为兼容/脚本通道（如 curl 测试）。
+const TOKEN_COOKIE = "td_token";
+
+function parseCookieHeader(req) {
+  const raw = String(req.headers["cookie"] || "");
+  const out = {};
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); }
+    catch (_) { out[part.slice(0, i).trim()] = part.slice(i + 1).trim(); }
+  }
+  return out;
+}
+// 是否在 HTTPS 之下（决定 Cookie 能否带 Secure）。部署在反代之后时看 x-forwarded-proto。
+function isHttpsRequest(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  if (proto) return proto === "https";
+  return !!(req.socket && req.socket.encrypted);
+}
+function setAuthCookie(res, req, token) {
+  const parts = [
+    TOKEN_COOKIE + "=" + encodeURIComponent(token),
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=" + Math.floor(SESSION_TTL_MS / 1000),
+  ];
+  if (isHttpsRequest(req)) parts.push("Secure");
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+function clearAuthCookie(res, req) {
+  const parts = [
+    TOKEN_COOKIE + "=",
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+  ];
+  if (isHttpsRequest(req)) parts.push("Secure");
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+// 从请求提取 Bearer token，回退到 httpOnly Cookie
 function getToken(req) {
   const h = req.headers["authorization"] || "";
   const m = /^Bearer\s+(.+)$/i.exec(h);
-  return m ? m[1].trim() : "";
+  if (m) return m[1].trim();
+  return String(parseCookieHeader(req)[TOKEN_COOKIE] || "").trim();
 }
 
 // token → 用户（含会话过期清理）
@@ -739,6 +821,11 @@ function saveShare(data) {
   const rec = {
     id,
     created_at: new Date().toISOString(),
+    // QA SEC-04：分享快照默认 7 天过期。此前响应里只有 created_at，
+    // 前端/调用方完全看不出「这个链接会失效」，误以为永久可读。
+    // 这里把过期时刻一并写入并在读取接口暴露，过期行为对调用方可见。
+    expires_at: new Date(Date.now() + SHARE_TTL_MS).toISOString(),
+    ttl_days: SHARE_TTL_MS / 86400000,
     train: (safe && safe.train) || "",
     data: safe,
   };
@@ -3188,7 +3275,7 @@ function handleRequest(req, res, parsed, pathname) {
   if (pathname === "/api/comments" && req.method === "POST") {
     if (rateLimited(res, "comment_post", req)) return;
     const user = getUserByToken(getToken(req));
-    if (!user) return sendJSON(res, 401, { error: "请先登录再评论" });
+    if (!user) return apiFail(res, 401, "E_LOGIN_REQUIRED", "请先登录再评论");
     readBody(req, (body) => {
       let payload;
       try {
@@ -3199,15 +3286,17 @@ function handleRequest(req, res, parsed, pathname) {
       if (payload && payload.__tooLarge) {
         return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内（可稍后重试，客户端会自动压缩）" });
       }
-      const text = String((payload && payload.content) || "").trim();
+      // QA FUNC-08：文档/第三方调用多用 `text`，服务端只认 `content` → 400。
+      // 两个字段名都收（content 优先），行为不变，接口更宽容。
+      const text = String(firstDefined(payload && payload.content, payload && payload.text) || "").trim();
       const rawImage = payload && payload.image;
 
       // 落库（文本 + 图片 URL 都已就绪）
       const commit = function (imageUrl) {
         try {
-          if (!text && !imageUrl) return sendJSON(res, 400, { error: "评论内容不能为空" });
+          if (!text && !imageUrl) return apiFail(res, 400, "E_COMMENT_EMPTY", "评论内容不能为空");
           if (text.length > COMMENT_MAX_LEN) {
-            return sendJSON(res, 400, { error: "评论最长 " + COMMENT_MAX_LEN + " 字" });
+            return apiFail(res, 400, "E_COMMENT_TOO_LONG", "评论最长 " + COMMENT_MAX_LEN + " 字");
           }
           const trainKey = normalizeTrainKey(payload.train || "");
           const list = readJSON(COMMENTS_FILE, []);
@@ -3261,14 +3350,14 @@ function handleRequest(req, res, parsed, pathname) {
   // 删除评论（仅本人）
   if (pathname === "/api/comments" && req.method === "DELETE") {
     const user = getUserByToken(getToken(req));
-    if (!user) return sendJSON(res, 401, { error: "未登录" });
+    if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
     const id = parsed.query.id || "";
-    if (!id) return sendJSON(res, 400, { error: "缺少参数 id" });
+    if (!id) return apiFail(res, 400, "E_MISSING_ID", "缺少参数 id");
     const list = readJSON(COMMENTS_FILE, []);
     const idx = list.findIndex((c) => c.id === id);
-    if (idx < 0) return sendJSON(res, 404, { error: "评论不存在" });
+    if (idx < 0) return apiFail(res, 404, "E_COMMENT_NOT_FOUND", "评论不存在");
     if (list[idx].email !== user.email) {
-      return sendJSON(res, 403, { error: "只能删除自己的评论" });
+      return apiFail(res, 403, "E_COMMENT_NOT_OWNER", "只能删除自己的评论");
     }
     const removed = list[idx];
     if (removed && removed.image) {
@@ -3290,15 +3379,15 @@ function handleRequest(req, res, parsed, pathname) {
     const m = pathname.match(/^\/api\/comments\/([^/]+)\/reply\/([^/]+)$/);
     if (m && req.method === "DELETE") {
       const user = getUserByToken(getToken(req));
-      if (!user) return sendJSON(res, 401, { error: "未登录" });
+      if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
       const list = readJSON(COMMENTS_FILE, []);
       const idx = list.findIndex((c) => c.id === m[1]);
-      if (idx < 0) return sendJSON(res, 404, { error: "评论不存在" });
+      if (idx < 0) return apiFail(res, 404, "E_COMMENT_NOT_FOUND", "评论不存在");
       const c = list[idx];
       const ri = (c.replies || []).findIndex((r) => r.id === m[2]);
-      if (ri < 0) return sendJSON(res, 404, { error: "回复不存在" });
+      if (ri < 0) return apiFail(res, 404, "E_REPLY_NOT_FOUND", "回复不存在");
       if (c.replies[ri].email !== user.email) {
-        return sendJSON(res, 403, { error: "只能删除自己的回复" });
+        return apiFail(res, 403, "E_COMMENT_NOT_OWNER", "只能删除自己的回复");
       }
       const removed = c.replies[ri];
       if (removed.image) {
@@ -3316,10 +3405,10 @@ function handleRequest(req, res, parsed, pathname) {
     if (m && req.method === "POST") {
       if (rateLimited(res, "comment_like", req)) return;
       const user = getUserByToken(getToken(req));
-      if (!user) return sendJSON(res, 401, { error: "请先登录" });
+      if (!user) return apiFail(res, 401, "E_LOGIN_REQUIRED", "请先登录");
       const list = readJSON(COMMENTS_FILE, []);
       const idx = list.findIndex((c) => c.id === m[1]);
-      if (idx < 0) return sendJSON(res, 404, { error: "评论不存在" });
+      if (idx < 0) return apiFail(res, 404, "E_COMMENT_NOT_FOUND", "评论不存在");
       const c = list[idx];
       if (m[2] === "like") {
         c.likedBy = c.likedBy || [];
@@ -3340,11 +3429,11 @@ function handleRequest(req, res, parsed, pathname) {
         if (payload && payload.__tooLarge) {
           return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内" });
         }
-        const text = String((payload && payload.content) || "").trim();
+        const text = String(firstDefined(payload && payload.content, payload && payload.text) || "").trim();
         const commitReply = function (imageUrl) {
           try {
-            if (!text && !imageUrl) return sendJSON(res, 400, { error: "回复内容不能为空" });
-            if (text.length > COMMENT_MAX_LEN) return sendJSON(res, 400, { error: "回复最长 " + COMMENT_MAX_LEN + " 字" });
+            if (!text && !imageUrl) return apiFail(res, 400, "E_REPLY_EMPTY", "回复内容不能为空");
+            if (text.length > COMMENT_MAX_LEN) return apiFail(res, 400, "E_REPLY_TOO_LONG", "回复最长 " + COMMENT_MAX_LEN + " 字");
             c.replies = c.replies || [];
             const reply = { id: crypto.randomBytes(4).toString("hex"), email: user.email, content: text, ts: new Date().toISOString(), image: imageUrl };
             c.replies.push(reply);
@@ -3386,14 +3475,19 @@ function handleRequest(req, res, parsed, pathname) {
         const { email, password } = JSON.parse(body || "{}");
         const em = String(email || "").trim().toLowerCase();
         if (!EMAIL_RE.test(em)) {
-          return sendJSON(res, 400, { error: "邮箱格式不正确" });
+          return apiFail(res, 400, "E_BAD_EMAIL", "邮箱格式不正确");
         }
         if (password === undefined || password === null || String(password) === "") {
-          return sendJSON(res, 400, { error: "密码不能为空" });
+          return apiFail(res, 400, "E_PASSWORD_EMPTY", "密码不能为空");
+        }
+        // 弱口令拦截（QA SEC-02）："123" 之类不再放行
+        const pwIssue = passwordIssue(password);
+        if (pwIssue) {
+          return apiFail(res, 400, pwIssue, PASSWORD_RULE_MSG);
         }
         const users = loadUsers();
         if (users[em]) {
-          return sendJSON(res, 409, { error: "该邮箱已注册，请直接登录" });
+          return apiFail(res, 409, "E_EMAIL_TAKEN", "该邮箱已注册，请直接登录");
         }
         const salt = crypto.randomBytes(16).toString("hex");
         users[em] = {
@@ -3407,6 +3501,7 @@ function handleRequest(req, res, parsed, pathname) {
         const sessions = loadSessions();
         sessions[token] = { email: em, created_at: new Date().toISOString() };
         writeJSONAtomic(SESSIONS_FILE, sessions);
+        setAuthCookie(res, req, token);   // httpOnly，前端不再存 localStorage
         return sendJSON(res, 200, { token, user: { email: em, created_at: users[em].created_at } });
       } catch (e) {
         return sendWriteError(res, e);
@@ -3425,12 +3520,13 @@ function handleRequest(req, res, parsed, pathname) {
         const users = loadUsers();
         const u = users[em];
         if (!u || u.hash !== hashPassword(password || "", u.salt)) {
-          return sendJSON(res, 401, { error: "邮箱或密码不正确" });
+          return apiFail(res, 401, "E_BAD_CREDENTIALS", "邮箱或密码不正确");
         }
         const token = crypto.randomBytes(24).toString("base64url");
         const sessions = loadSessions();
         sessions[token] = { email: em, created_at: new Date().toISOString() };
         writeJSONAtomic(SESSIONS_FILE, sessions);
+        setAuthCookie(res, req, token);   // httpOnly
         return sendJSON(res, 200, { token, user: { email: em, created_at: u.created_at } });
       } catch (e) {
         return sendWriteError(res, e);
@@ -3447,20 +3543,21 @@ function handleRequest(req, res, parsed, pathname) {
       delete sessions[token];
       writeJSONAtomic(SESSIONS_FILE, sessions);
     }
+    clearAuthCookie(res, req);
     return sendJSON(res, 200, { ok: true });
   }
 
   // 当前用户
   if (pathname === "/api/me") {
     const user = getUserByToken(getToken(req));
-    if (!user) return sendJSON(res, 401, { error: "未登录" });
+    if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
     return sendJSON(res, 200, { user });
   }
 
   // 查询历史（登录后可见；train 记录附带预测 vs 实际对比）
   if (pathname === "/api/history" && req.method === "GET") {
     const user = getUserByToken(getToken(req));
-    if (!user) return sendJSON(res, 401, { error: "未登录" });
+    if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
     const list = (loadHistory()[user.email] || []).map(enrichHistory);
     return sendJSON(res, 200, { history: list });
   }
@@ -3468,11 +3565,11 @@ function handleRequest(req, res, parsed, pathname) {
   // 回填某条车次预测历史的实际延误（懒回填：调 train_insight 拉近 8 天实际）
   if (pathname === "/api/history/backfill" && req.method === "POST") {
     const user = getUserByToken(getToken(req));
-    if (!user) return sendJSON(res, 401, { error: "未登录" });
+    if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
     readBody(req, (body) => {
       let id = "";
       try { id = String((JSON.parse(body || "{}").id) || ""); } catch (e) { id = ""; }
-      if (!id) return sendJSON(res, 400, { error: "缺少参数 id" });
+      if (!id) return apiFail(res, 400, "E_MISSING_ID", "缺少参数 id");
       const hist = loadHistory();
       const list = hist[user.email] || [];
       const idx = list.findIndex((r) => r.id === id);
@@ -3535,9 +3632,9 @@ function handleRequest(req, res, parsed, pathname) {
   // 删除单条历史（?id=xxx）
   if (pathname === "/api/history" && req.method === "DELETE") {
     const user = getUserByToken(getToken(req));
-    if (!user) return sendJSON(res, 401, { error: "未登录" });
+    if (!user) return apiFail(res, 401, "E_NOT_LOGGED_IN", "未登录");
     const id = parsed.query.id || "";
-    if (!id) return sendJSON(res, 400, { error: "缺少参数 id" });
+    if (!id) return apiFail(res, 400, "E_MISSING_ID", "缺少参数 id");
     const hist = loadHistory();
     const list = hist[user.email] || [];
     hist[user.email] = list.filter((r) => r.id !== id);
@@ -3588,13 +3685,15 @@ function handleRequest(req, res, parsed, pathname) {
         const payload = JSON.parse(body || "{}");
         const data = payload.data;
         if (!data || !data.train) {
-          return sendJSON(res, 400, { error: "缺少预测数据 data.train" });
+          return apiFail(res, 400, "E_SHARE_MISSING_TRAIN", "缺少预测数据 data.train");
         }
         const rec = saveShare(data);
         return sendJSON(res, 200, {
           id: rec.id,
           url: `/?share=${rec.id}`,
           created_at: rec.created_at,
+          expires_at: rec.expires_at,
+          ttl_days: rec.ttl_days,
           train: rec.train,
         });
       } catch (e) {
@@ -3609,9 +3708,11 @@ function handleRequest(req, res, parsed, pathname) {
     const id = pathname.slice("/api/share/".length);
     const rec = loadShare(id);
     if (!rec) {
-      return sendJSON(res, 404, { error: "分享不存在或已过期" });
+      return apiFail(res, 404, "E_SHARE_NOT_FOUND", "分享不存在或已过期");
     }
     return sendJSON(res, 200, { id: rec.id, created_at: rec.created_at,
+                                expires_at: rec.expires_at || null,
+                                ttl_days: rec.ttl_days || SHARE_TTL_MS / 86400000,
                                 train: rec.train, data: rec.data });
   }
 

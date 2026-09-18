@@ -2845,3 +2845,24 @@ textarea:focus-visible {
 .route-delay-row .station-clear { right: 12px; }
 /* 单车次栏（.search）：容器承接原 input 的 flex 位置；该框有 datalist 箭头 → right 24px 继承默认 */
 .search .search-train-field { flex: 1 1 260px; }
+
+/* ===== 主题切换颜色过渡（2026-09-18，QA ENG-14）===== */
+/* 深色/浅色切换原先是硬跳变，夜间切换刺眼。给颜色相关属性加 180ms 过渡。
+   选择器用 * （优先级 0）：不会覆盖任何类选择器已有的 transition 定义，
+   只对从未定义过 transition 的元素生效 —— 现有按钮/弹层动画不受影响。 */
+* {
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    color 180ms ease,
+    fill 180ms ease,
+    stroke 180ms ease;
+}
+/* 前庭敏感用户：跟随系统减弱动画设置，主题切换退回瞬时完成 */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
