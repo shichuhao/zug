@@ -91,6 +91,76 @@ const SPAWN_MAX_CONCURRENCY = (() => {
   return Number.isFinite(v) && v >= 1 ? v : 1;
 })();
 let _spawnActive = 0;
+
+// ── 行程腿排队闸门（2026-09-19）──────────────────────────────────────────
+// 问题（线上复现）：行程分析页会把每一段车次「同时」发出去（前端 Promise.all），
+// 而常驻 worker 的并发上限是 1（PREDICTOR_MAX_CONCURRENCY=1，实测结论：并发 4
+// 会把 RssAnon 从 3.5GB 推到 4.6GB 然后被 cgroup OOM 清掉）。结果是：
+//   5 段行程 → 1 个占住闸门跑 20~30s，其余 4 个立刻拿到 503 worker_busy。
+// 前端对 503 只提示「繁忙请重试」，用户看到的就是满页「Keine Daten / 无数据」。
+//
+// 这里把「同一浏览器会话在途的行程腿」串行化：第 2 段起排队等前一段跑完再发，
+// 而不是并发抢闸门被拒。仅对带 ride_from/ride_to 的行程腿生效 —— 单条车次查询
+// 的既有并发合并（trainInflight）与压测结论不受影响。
+//
+// 队首等待上限：等太久就直接 503 + Retry-After，让前端明确提示「繁忙」而不是
+// 干等到浏览器超时。实测单段冷查询 6~30s，个别串行慢查询可到 60s+（区域列车逐站
+// 抓取 + 多账号轮换）。2026-09-19 首版给 45s，实测 5 段行程里最后一段会被拒：
+// 前几段串行累计超过 45s 时，队尾那段还没轮到就被判超时。放宽到 100s，与前端
+// 行程腿超时（75s）+ 浏览器默认超时（60s×2 队列）综合权衡后的取值。
+const JOURNEY_LANE_MAX_WAIT_MS = (() => {
+  const v = parseInt(process.env.JOURNEY_LANE_MAX_WAIT_MS, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 100000;
+})();
+const journeyLane = { active: 0, queue: [] };
+let _journeyLaneSeq = 0;
+
+// 取号并登记。返回 { id, waitMs }；等待超时返回 null（调用方应直接回 503）。
+function journeyLaneAcquire(cb) {
+  if (journeyLane.active === 0) {
+    journeyLane.active = 1;
+    return cb({ id: ++_journeyLaneSeq, waitMs: 0 });
+  }
+  const id = ++_journeyLaneSeq;
+  const startedAt = Date.now();
+  const ticket = { id, startedAt, cb, timer: null };
+  ticket.timer = setTimeout(() => {
+    const i = journeyLane.queue.indexOf(ticket);
+    if (i >= 0) journeyLane.queue.splice(i, 1);
+    console.warn("[journey-lane] " + JSON.stringify({
+      event: "queue_timeout", id, waited_ms: Date.now() - startedAt,
+    }));
+    cb(null);
+  }, JOURNEY_LANE_MAX_WAIT_MS);
+  if (ticket.timer.unref) ticket.timer.unref();
+  journeyLane.queue.push(ticket);
+  console.log("[journey-lane] " + JSON.stringify({
+    event: "queued", id, queue_len: journeyLane.queue.length,
+    max_wait_ms: JOURNEY_LANE_MAX_WAIT_MS,
+  }));
+  return undefined;
+}
+
+// 释放并把闸门交给队首。必须幂等：worker 路径、spawn 降级路径、各种错误分支
+// 都会走到这里，重复调用不能让 active 继续自增（否则闸门永久泄漏 → 全站 503）。
+function journeyLaneRelease(id, waited, cb) {
+  while (journeyLane.queue.length) {
+    const next = journeyLane.queue.shift();
+    if (!next) break;
+    if (next.timer) clearTimeout(next.timer);
+    const waitMs = Date.now() - next.startedAt;
+    console.log("[journey-lane] " + JSON.stringify({
+      event: "granted", id: next.id, waited_ms: waitMs,
+      queue_len: journeyLane.queue.length,
+    }));
+    // 交接：active 保持 1，不归零（避免「释放」与「唤醒」之间出现空窗被后来的
+    // 请求插队，破坏 FIFO）
+    return next.cb({ id: next.id, waitMs });
+  }
+  journeyLane.active = 0;
+  if (cb) return cb();
+  return undefined;
+}
 // 常驻预测 worker（2026-09-14 架构升级）：缺省开启，设 PREDICTOR_WORKER_URL="" 可关闭
 // 回落到 spawn-per-request 老路径（老路径已原样保留作降级）。
 const PREDICTOR_WORKER_URL =
@@ -106,7 +176,8 @@ const WORKER_TIMEOUT_MS = (() => {
 
 // 调用常驻 worker 做预测，返回解析好的 dict（含 error 字段表示业务失败）。
 // worker 本身负责串行/并发闸门；这里只做 HTTP + JSON + 超时。
-function callPredictorWorker(params) {
+// opts.onAbortRegister(fn)：把「主动中断本次请求」注册给调用方（预热让路用）。
+function callPredictorWorker(params, opts) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(params || {});
     const u = new URL("/predict", PREDICTOR_WORKER_URL);
@@ -148,6 +219,11 @@ function callPredictorWorker(params) {
         });
       });
     } catch (e) { return reject(e); }
+    if (opts && typeof opts.onAbortRegister === "function") {
+      opts.onAbortRegister(function () {
+        try { req.destroy(new Error("warmup yield")); } catch (_) {}
+      });
+    }
     req.setTimeout(WORKER_TIMEOUT_MS, () => {
       try { req.destroy(new Error("worker 超时 " + WORKER_TIMEOUT_MS + "ms")); } catch (_) {}
     });
@@ -2815,6 +2891,8 @@ function handleRequest(req, res, parsed, pathname) {
     if (!train) {
       return respond(400, { error: "缺少参数 train" }, { reason: "missing_train" });
     }
+    // 记录真实用户活动：预热靠它判断「现在空闲」才动手，绝不与用户抢 worker 槽位
+    noteUserTraffic();
     const cacheParams = { train, days, predictDate, destination, rideFrom, rideTo, rideTime };
     const cacheKey = predictionCacheKey(cacheParams);
     const respondTrain = (data, extra) => {
@@ -2838,6 +2916,31 @@ function handleRequest(req, res, parsed, pathname) {
       return respondTrain(diskData, { cache_hit: true, cache_source: "disk" });
     }
     res.setHeader("X-Cache", "MISS");
+    // ── 行程腿串行闸门（2026-09-19）──────────────────────────────────────
+    // 详见 journeyLane 定义处。只有「行程腿」（带 ride_from + ride_to）才排队：
+    // 单条车次查询维持原行为（并发合并 → 超限即 503），避免影响压测结论。
+    const isJourneyLeg = !!(rideFrom && rideTo);
+    if (isJourneyLeg) {
+      return journeyLaneAcquire(function (ticket) {
+        if (!ticket) {
+          res.setHeader("Retry-After", "5");
+          return respond(503, { error: "预测服务繁忙，请稍后重试", retryable: true },
+                  { source: "lane", reason: "lane_wait_timeout" });
+        }
+        if (ticket.waitMs > 0) res.setHeader("X-Queue-Wait", String(ticket.waitMs));
+        return runPredictionPath(ticket);
+      });
+    }
+    return runPredictionPath(null);
+
+    // 预测主流程（缓存已在上面查过）。laneTicket 非空时表示持闸门，结束时必须释放。
+    function runPredictionPath(laneTicket) {
+    let _laneReleased = false;
+    const _releaseLane = function () {
+      if (_laneReleased) return;
+      _laneReleased = true;
+      if (laneTicket) journeyLaneRelease(laneTicket.id, laneTicket.waitMs);
+    };
     // ── 并发合并（request coalescing，2026-09-14 压测发现）────────────────
     // 缺口：N 个用户同时查同一冷车次 → spawn N 个 python，做 N 遍完全相同的
     //   计算（单进程峰值 RSS 3.4GB），在 4 核配额下全部撞上超时 → N 人一起 502。
@@ -2869,6 +2972,7 @@ function handleRequest(req, res, parsed, pathname) {
           });
           trainInflight.delete(inflightKey);
         }
+        _releaseLane(); // 成功也归还闸门（幂等，最后一定会走到这里）
         return _origRespondTrain(data, extra);
       };
     }();
@@ -2888,6 +2992,7 @@ function handleRequest(req, res, parsed, pathname) {
       const st = trainInflight.get(inflightKey);
       const ws = (st && st.waiters) || [];
       _clearInflight();
+      _releaseLane(); // 任何失败分支都必须归还行程腿闸门（幂等）
       ws.forEach(function (w) {
         try {
           if (w && w.fail) w.fail(code, payload, extra);
@@ -2931,6 +3036,7 @@ function handleRequest(req, res, parsed, pathname) {
       recordPredictionHistory(req, data, cacheParams);
       setPredictionCache(cacheKey, data);
       setTrainDiskCache(cacheKey, data);
+      _releaseLane(); // 成功后立即放行下一段行程腿（结果派发不占闸门）
       // 走 broadcast：把结果同时派发给所有排队的并发请求
       return respondTrain2(data, Object.assign({ cache_hit: false }, extra || {}));
     };
@@ -3067,6 +3173,7 @@ function handleRequest(req, res, parsed, pathname) {
       }
     });
     } // end spawnPredict
+    } // end runPredictionPath
   }
 
   // ---- 晚点成分拆解（懒加载）：前端展开「晚点成分构成」面板时才调用 ----
@@ -4231,24 +4338,94 @@ function warmupOneTrain(train, useWorker) {
     console.log("[warmup] hit  " + train);
     return Promise.resolve("hit");
   }
-  // 优先走常驻 worker：模型已在 worker 里常驻，预热只是一轮 HTTP 推理，
-  // 不再 fork 一个峰值 3.4GB 的 python。这是预热能在内存紧张环境里真正
-  // 跑起来的前提（见 WARMUP_MEM_MIN_MB_WORKER 注释）。
+  // 让路（2026-09-19 新增）：预热不能与用户请求抢唯一的那一个 worker 并发槽。
+  // worker 的 PREDICTOR_MAX_CONCURRENCY=1 是实测结论（并发 4 → RssAnon 3.5→4.6GB
+  // → cgroup OOM 清场）。预热若正巧占着槽位，用户冷查询就拿到 503 worker_busy。
+  // 这里串行等待「无人查 / 无人排队」再动手，占用期间也持续检查——
+  // 一旦有真实请求进来就立刻中断本轮预热（写缓存只是优化，晚一轮无害）。
   if (useWorker) {
-    return callPredictorWorker({ train, days: 8, date: predictDate,
-                                 destination: "", rideFrom: "", rideTo: "", rideTime: "" })
-      .then(function (data) {
-        if (!data || data.error) { console.warn("[warmup] worker bad " + train); return "bad"; }
-        finishWarmup(train, data, key, predictDate, "worker");
-        return "ok";
-      })
-      .catch(function (e) {
-        // worker 繁忙/不可达 → 回退 spawn（仍受 spawn 的高内存门槛保护）
-        console.warn("[warmup] worker fail " + train + ": " + (e && e.message) + " → 回退 spawn");
-        return warmupSpawn(train, predictDate, key);
-      });
+    return waitForIdleThenWarmup(train, predictDate, key);
   }
   return warmupSpawn(train, predictDate, key);
+}
+
+// 预热让路：等待 worker 空闲（无人查 + 无行程腿排队），并在预备发起时再次确认。
+const WARMUP_IDLE_MIN_MS = (() => {
+  const v = parseInt(process.env.WARMUP_IDLE_MIN_MS, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 20000;
+})();
+const WARMUP_IDLE_POLL_MS = 2000;
+// 无活动判定窗口：最近 idleMinMs 内既没有 /api/train 请求，也没有在途 spawn。
+const _traffic = { lastAt: 0 };
+function noteUserTraffic() { _traffic.lastAt = Date.now(); }
+function trafficIdleMs() { return Date.now() - _traffic.lastAt; }
+
+function warmupBusy() {
+  if (_spawnActive > 0) return true;
+  if (journeyLane.active > 0 || journeyLane.queue.length > 0) return true;
+  return false;
+}
+
+function waitForIdleThenWarmup(train, predictDate, key) {
+  const budgetMs = WARMUP_IDLE_MIN_MS * 6; // 最多等 6 倍窗口，等不到就跳过本轮
+  const startedAt = Date.now();
+  return new Promise(function (resolve) {
+    (function poll() {
+      if (getTrainDiskCache(key)) { return resolve("hit"); }
+      const idle = trafficIdleMs();
+      if (idle >= WARMUP_IDLE_MIN_MS && !warmupBusy()) {
+        // 发起前最后确认，避免「刚判定空闲就有请求进来」
+        if (trafficIdleMs() >= WARMUP_IDLE_MIN_MS && !warmupBusy()) {
+          console.log("[warmup] idle " + Math.round(idle / 1000) + "s，开始预热 " + train);
+          return resolve(warmupViaWorkerOnce(train, predictDate, key));
+        }
+      }
+      if (Date.now() - startedAt >= budgetMs) {
+        console.warn("[warmup] 让路超时 " + Math.round(budgetMs / 1000) + "s，跳过本轮预热（避开用户高峰）");
+        return resolve("skipped");
+      }
+      const t = setTimeout(poll, WARMUP_IDLE_POLL_MS);
+      if (t.unref) t.unref();
+      return undefined;
+    })();
+  });
+}
+
+// 单次 worker 预热：占用期间监控是否有真实请求进来，有则中断让出槽位。
+function warmupViaWorkerOnce(train, predictDate, key) {
+  const startedAt = Date.now();
+  const abort = { fire: () => {} };
+  let yielded = false;
+  // 请求进来的判定：不是看 _traffic（预热自己也可能触发历史记录），而是看
+  // 「本次预热开始后是否出现了新的排队/在途请求」。这里用轮询 + 一次性的取消标记。
+  const watch = setInterval(() => {
+    if (Date.now() - startedAt < 500) return;
+    if (!yielded && warmupBusy()) {
+      yielded = true;
+      console.warn("[warmup] 检测到用户请求，让出 worker 槽位并中断本轮预热 " + train);
+      try { abort.fire(); } catch (_) {}
+    }
+  }, 500);
+  if (watch.unref) watch.unref();
+
+  const p = callPredictorWorker({ train, days: 8, date: predictDate,
+                                  destination: "", rideFrom: "", rideTo: "", rideTime: "" },
+                                { onAbortRegister: (fn) => { abort.fire = fn; } })
+    .then(function (data) {
+      clearInterval(watch);
+      if (yielded) return "yielded";
+      if (!data || data.error) { console.warn("[warmup] worker bad " + train); return "bad"; }
+      finishWarmup(train, data, key, predictDate, "worker");
+      return "ok";
+    })
+    .catch(function (e) {
+      clearInterval(watch);
+      if (yielded) return "yielded";
+      // worker 繁忙/不可达 → 回退 spawn（仍受 spawn 的高内存门槛保护）
+      console.warn("[warmup] worker fail " + train + ": " + (e && e.message) + " → 回退 spawn");
+      return warmupSpawn(train, predictDate, key);
+    });
+  return p;
 }
 
 // 预热结果统一落盘：_query 必须与 cacheKey 对齐，否则 /api/breakdown 回放错位

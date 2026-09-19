@@ -150,27 +150,53 @@ function journeyPredictionUrl(leg, date) {
 }
 async function predictJourney(legs, dateHint, signal) {
   const date = dateHint || (journeyUrlInput.value.match(/202\d-[01]\d-[0-3]\d/) || [""])[0];
-  // Run legs together so one slow DB/zugfinder request cannot make the whole
-  // journey appear frozen for N x 90 seconds.
-  const predictions = await Promise.all(legs.map(async function (leg) {
-    if (!journeyPredictionUrl(leg, date)) return { error: "unsupported_service" };
-    try { return await fetchJSON(journeyPredictionUrl(leg, date), { timeout: 35000, signal: signal }); }
-    catch (e) {
-      if (e && (e.name === "AbortError" || String(e).indexOf("AbortError") >= 0)) throw e; // 切页中止，静默
-      return { error: queryTransportError(e) };
+  // 并发上限 2（2026-09-19 修复「Keine Daten / 无数据」满屏）。
+  // 背景：worker 的并发上限是 1（PREDICTOR_MAX_CONCURRENCY=1，实测结论）。
+  // 之前这里把 N 段全部 Promise.all 发出去 —— 1 段占住闸门跑 20~30s，其余
+  // 立刻吃 503 worker_busy，页面上就是一条接一条的「无数据」。
+  // 现在最多同时 2 个在途：一个在算、一个在服务端闸门排队（server 侧有
+  // 行程腿串行队列），既不让请求白白被拒，又不会把栈堆到超时。
+  const CONCURRENCY = 2;
+  const predictions = new Array(legs.length);
+  let nextIdx = 0;
+  const worker = async function () {
+    while (true) {
+      const i = nextIdx++;
+      if (i >= legs.length) return;
+      const leg = legs[i];
+      if (!journeyPredictionUrl(leg, date)) { predictions[i] = { error: "unsupported_service" }; continue; }
+      try {
+        // 超时给到 180s：服务端排队是串行的（worker 并发上限 1），单段最坏
+        // 30s 计算 + 前面几段排队累计，原先 35s 会让「排到了但还在算」的请求
+        // 被前端自己掐掉，用户看到的就是满屏「无数据」而不是「超时」。
+        // 服务端有 120s 的 worker 超时兜底，这里给足余量等它给出明确答复。
+        predictions[i] = await fetchJSON(journeyPredictionUrl(leg, date), { timeout: 180000, signal: signal });
+      } catch (e) {
+        if (e && (e.name === "AbortError" || String(e).indexOf("AbortError") >= 0)) throw e; // 切页中止，静默
+        predictions[i] = { error: queryTransportError(e) };
+      }
     }
-  }));
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, legs.length) }, worker));
   const cards = predictions.map(function (p, i) {
-    const leg = legs[i], x = p.prediction || {}, seg = p.segment || {};
+    const leg = legs[i], x = (p && p.prediction) || {}, seg = (p && p.segment) || {};
     const point = x.point_estimate != null ? x.point_estimate : seg.point_estimate;
     const p90 = x.p90 != null ? x.p90 : seg.p90;
-    return { leg, prediction: p, point, p90, risk: x.prob_ge15 != null ? x.prob_ge15 : seg.prob_ge15 };
+    return { leg, prediction: p || {}, point, p90, risk: x.prob_ge15 != null ? x.prob_ge15 : seg.prob_ge15 };
   });
   lastJourney = { legs: legs, date: date, cards: cards };
   const html = '<div class="journey-summary"><strong>' + escapeHtml(legs[0].from) + ' → ' + escapeHtml(legs[legs.length - 1].to) + '</strong><span>' + t("journey.summary", { n: legs.length }) + '</span></div>' + cards.map(function (c, i) {
     const next = legs[i + 1];
     const buffer = next ? journeyBuffer(c.leg.arr, next.dep) : null;
-    const delay = c.prediction.error === "unsupported_service" ? t("journey.unsupported") : (c.point == null ? t("journey.noData") : "+" + Math.round(c.point) + " " + t("unit.min"));
+    // 「无数据」分三种，别混成一个：
+    //   1) 该次查询本身失败（繁忙/超时/网络）→ 展示具体原因，不是「无数据」
+    //   2) 查询成功但这一段的区间确实没有历史样本 → 真正的无数据
+    //   3) 非支持的车型（S/U/Bus）→ 明确说明不支持
+    const failed = c.prediction && c.prediction.error && c.prediction.error !== "unsupported_service";
+    const delay = c.prediction.error === "unsupported_service"
+      ? t("journey.unsupported")
+      : (failed ? String(c.prediction.error)
+        : (c.point == null ? t("journey.noData") : "+" + Math.round(c.point) + " " + t("unit.min")));
     const risk = journeyPercent(c.risk);
     let connection = "";
     if (next && buffer != null) {
