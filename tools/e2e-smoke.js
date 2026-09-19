@@ -87,6 +87,21 @@ const BASE = process.env.E2E_BASE || "http://127.0.0.1:3000";
       return false;
     });
     if (tabReg) {
+      // 切到注册 tab 后应显示图形验证码，并从 /api/captcha 拿到内联 SVG（SEC-01）
+      await page.waitForTimeout(600);
+      const cap = await page.evaluate(() => {
+        const row = document.getElementById("authCaptchaRow");
+        const img = document.getElementById("authCaptchaImg");
+        return {
+          visible: !!row && !row.classList.contains("hidden"),
+          src: img ? String(img.getAttribute("src") || "").slice(0, 24) : "",
+        };
+      });
+      ok("注册 tab 显示图形验证码", cap.visible && cap.src.indexOf("data:image/svg") === 0,
+        JSON.stringify(cap));
+
+      // 弱密码应被前端拦下（服务端还有一层硬校验）
+      await page.fill("#authPassword", "123");
       await page.click("#authSubmit").catch(() => {});
       await page.waitForTimeout(300);
       const msg = await page.textContent("#authMsg").catch(() => "");

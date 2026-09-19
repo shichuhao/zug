@@ -93,6 +93,39 @@ function passwordStrong(pw) {
   return s.length >= 8 && s.length <= 128 && /[A-Za-z]/.test(s) && /[0-9]/.test(s);
 }
 
+/* ---------- 图形验证码（QA SEC-01）---------- */
+// 仅注册需要。答案在服务端内存里，前端只拿到 SVG；一次一用（提交后即作废），
+// 所以每次提交失败都要重新取一张。
+var captchaId = "";
+
+function updateCaptchaRow() {
+  var row = document.getElementById("authCaptchaRow");
+  if (!row) return;
+  var isReg = authTab === "register";
+  row.classList.toggle("hidden", !isReg);
+  if (isReg && !captchaId) loadCaptcha();
+}
+function loadCaptcha() {
+  var img = document.getElementById("authCaptchaImg");
+  if (!img) return;
+  captchaId = "";
+  var inp = document.getElementById("authCaptchaInput");
+  if (inp) inp.value = "";
+  fetch("/api/captcha", { credentials: "same-origin" })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || d.disabled) {   // 服务端显式关闭（CAPTCHA_DISABLED=1）
+        var row = document.getElementById("authCaptchaRow");
+        if (row) row.classList.add("hidden");
+        return;
+      }
+      captchaId = d.id || "";
+      // data: URL 内联进 img —— 免额外请求，也不受 CSP img-src 'self' data: 之外的限制
+      img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(d.svg || "");
+    })
+    .catch(function () { /* 取不到就不显示；提交时服务端会明确报错 */ });
+}
+
 function syncAuthTabs() {
   var tabLogin = document.getElementById("tabLogin");
   var tabReg = document.getElementById("tabRegister");
@@ -100,6 +133,7 @@ function syncAuthTabs() {
   if (tabLogin) tabLogin.classList.toggle("active", authTab === "login");
   if (tabReg) tabReg.classList.toggle("active", authTab === "register");
   if (submit) submit.textContent = authTab === "login" ? t("auth.tabLogin") : t("auth.tabRegister");
+  updateCaptchaRow();
 }
 
 async function submitAuth() {
@@ -119,16 +153,30 @@ async function submitAuth() {
   var submit = document.getElementById("authSubmit");
   if (submit) submit.disabled = true;
   try {
+    var payload = { email: email, password: pw };
+    if (authTab === "register") {
+      // 验证码一次性：这里带上当前这套 id + 输入值（服务端校验后立即作废）
+      var capEl = document.getElementById("authCaptchaInput");
+      payload.captcha_id = captchaId;
+      payload.captcha_code = capEl ? (capEl.value || "").trim() : "";
+    }
     var resp = await fetch(authTab === "login" ? "/api/login" : "/api/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",   // 接收并保存 httpOnly 会话 Cookie
-      body: JSON.stringify({ email: email, password: pw })
+      body: JSON.stringify(payload)
     });
     var data = null;
     try { data = await resp.json(); } catch (e) {}
     if (!resp.ok || !data || !data.token) {
-      showAuthMsg((data && data.error) ? localErrStr(data.error) : t("auth.fail"), true);
+      var code = data && data.error;
+      showAuthMsg(code ? localErrStr(code) : t("auth.fail"), true);
+      // 验证码类失败：旧的那张已作废（或过期），立刻换一张并聚焦输入框
+      if (code === "E_CAPTCHA_INVALID" || code === "E_CAPTCHA_EXPIRED" || code === "E_CAPTCHA_REQUIRED") {
+        loadCaptcha();
+        var ci = document.getElementById("authCaptchaInput");
+        if (ci) ci.focus();
+      }
       return;
     }
     // 会话已在 httpOnly Cookie 中，前端不再持有 token。
@@ -417,6 +465,11 @@ function initAuth() {
   if (authClose) authClose.addEventListener("click", closeAuth);
   var histClose = document.getElementById("historyClose");
   if (histClose) histClose.addEventListener("click", closeHistory);
+  // 验证码刷新：点图片或「换一张」按钮都行（键盘用户走按钮）
+  var capImg = document.getElementById("authCaptchaImg");
+  if (capImg) capImg.addEventListener("click", loadCaptcha);
+  var capRefresh = document.getElementById("authCaptchaRefresh");
+  if (capRefresh) capRefresh.addEventListener("click", loadCaptcha);
   var tabLogin = document.getElementById("tabLogin");
   if (tabLogin) tabLogin.addEventListener("click", function () { authTab = "login"; syncAuthTabs(); });
   var tabReg = document.getElementById("tabRegister");
@@ -441,3 +494,9 @@ function initAuth() {
   var cmtLb = document.getElementById("commentLightbox");
   if (cmtLb) cmtLb.addEventListener("click", function (e) { if (e.target === cmtLb) closeCommentLightbox(); });
 }
+
+// ---- 模块启动点 ----
+// 这个调用原先落在 comments.js 末尾（按行拆分时的副作用）。认证初始化属于本模块职责，
+// 放回这里让 comments.js 只负责评论与访客统计。执行顺序不受影响：
+// auth.js 先于 comments.js 加载，两个顶层调用都发生在 DOM 解析完成后。
+initAuth();

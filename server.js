@@ -430,6 +430,7 @@ function writeJSONAtomic(p, obj) {
 const RATE_LIMITS = {
   // route        : [窗口毫秒, 窗口内允许次数]
   register:        [10 * 60 * 1000, 5],    // 注册：10 分钟 5 次
+  captcha_get:     [60 * 1000, 20],        // 取验证码：1 分钟 20 张（防刷图接口）
   login:           [5 * 60 * 1000, 20],    // 登录：5 分钟 20 次（防撞库）
   comment_post:    [60 * 1000, 5],         // 发评论：1 分钟 5 条
   comment_like:    [60 * 1000, 60],        // 点赞：1 分钟 60 次（正常用户够用）
@@ -650,6 +651,114 @@ function firstDefined() {
 function apiFail(res, status, code, zh) {
   return sendJSON(res, status, { error: code, message: zh || code });
 }
+
+// ===================== 图形验证码（2026-09-19，QA SEC-01）=====================
+// QA 对注册防刷的建议是两条：IP 维度限流 + 图形验证码。限流在 2026-09-18 已落地
+// （10 分钟 5 次/IP），这里补第二条 —— 限流只是「减速」，验证码才是把脚本和真人
+// 分开的那道门。实现零依赖：随机串只在服务端内存里，SVG 手绘，5 分钟 TTL、一次性。
+// 可用 CAPTCHA_DISABLED=1 关闭（本地联调 / 内网环境）。
+const CAPTCHA_TTL_MS = 5 * 60 * 1000;
+const CAPTCHA_DISABLED = String(process.env.CAPTCHA_DISABLED || "") === "1";
+const CAPTCHA_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 去掉 I/O/0/1 等易混字符
+const CAPTCHA_LEN = 4;
+const _captchas = new Map(); // id -> { code, exp }
+
+function newCaptcha() {
+  const id = crypto.randomBytes(12).toString("base64url");
+  let code = "";
+  for (let i = 0; i < CAPTCHA_LEN; i++) code += CAPTCHA_CHARS[crypto.randomInt(CAPTCHA_CHARS.length)];
+  _captchas.set(id, { code: code, exp: Date.now() + CAPTCHA_TTL_MS });
+  return { id: id, code: code };
+}
+
+// 5x7 点阵字形，只覆盖 CAPTCHA_CHARS 用到的 32 个字符（24 字母 + 8 数字）。
+// 为什么不直接用 <text>：SVG 里的文本节点是明文，脚本一行正则就能读出答案 ——
+// 那样验证码形同虚设（第一版就是这么写的，已纠正）。改成点阵矩形后，
+// 客户端拿到的只是一堆几何图形，要过就得真做 OCR。
+const CAPTCHA_GLYPHS = {
+  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+  B: ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+  C: ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
+  D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+  E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+  F: ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+  G: ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
+  H: ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+  J: ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+  K: ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+  L: ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+  M: ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+  N: ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+  Q: ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+  R: ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+  S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+  U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+  V: ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+  W: ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
+  X: ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+  Y: ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+  Z: ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+  2: ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+  3: ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
+  4: ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+  5: ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+  6: ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+  7: ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+  8: ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+  9: ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+};
+
+function captchaSvg(code) {
+  const CELL = 5, CW = 5, CH = 7;
+  const glyphW = CW * CELL, glyphH = CH * CELL;   // 25 x 35
+  const pad = 8, gap = 8;
+  const W = pad * 2 + code.length * glyphW + (code.length - 1) * gap;
+  const H = pad * 2 + glyphH;
+  const out = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H +
+    '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="captcha">',
+    '<rect width="' + W + '" height="' + H + '" fill="#f1f5f9"/>'];
+  for (let i = 0; i < code.length; i++) {
+    const g = CAPTCHA_GLYPHS[code[i]];
+    if (!g) continue;
+    const ox = pad + i * (glyphW + gap);
+    const oy = pad;
+    const cells = [];
+    for (let r = 0; r < CH; r++) {
+      for (let c = 0; c < CW; c++) {
+        if (g[r][c] !== "1") continue;
+        cells.push('<rect x="' + (ox + c * CELL) + '" y="' + (oy + r * CELL) +
+          '" width="' + CELL + '" height="' + CELL + '"/>');
+      }
+    }
+    out.push('<g fill="#1f2933">' + cells.join("") + '</g>');
+  }
+  // 干扰线压在字符之上（部分遮挡，提高 OCR 成本）
+  for (let i = 0; i < 4; i++) {
+    out.push('<line x1="' + crypto.randomInt(W) + '" y1="' + crypto.randomInt(H) +
+      '" x2="' + crypto.randomInt(W) + '" y2="' + crypto.randomInt(H) +
+      '" stroke="#64748b" stroke-width="1.2" opacity="0.55"/>');
+  }
+  out.push('</svg>');
+  return out.join("");
+}
+
+// 校验并作废：无论成功与否都删除 id —— 同一个验证码只允许被试一次。
+function verifyCaptcha(id, input) {
+  if (CAPTCHA_DISABLED) return null;
+  const key = String(id || "");
+  const rec = _captchas.get(key);
+  if (!rec) return "E_CAPTCHA_REQUIRED";
+  _captchas.delete(key);
+  if (Date.now() > rec.exp) return "E_CAPTCHA_EXPIRED";
+  if (String(input || "").trim().toUpperCase() !== rec.code) return "E_CAPTCHA_INVALID";
+  return null;
+}
+setInterval(function () {
+  const now = Date.now();
+  for (const [k, v] of _captchas) if (now > v.exp) _captchas.delete(k);
+}, 60 * 1000).unref();
 
 // ---- 会话 Cookie（2026-09-18，QA SEC-03）----
 // token 原先只走 Authorization: Bearer，前端被迫存 localStorage，
@@ -1005,35 +1114,45 @@ function applySecurityHeaders(res) {
 
 // ---- 响应 gzip（2026-09-18，QA PERF-07）----
 // /api/train 的预测响应动辄几百 KB，app.js 也有 249KB：gzip 后通常只剩 1/5，
-// 传输时间与首屏都实打实变快。只对「声明支持 gzip + 体量够大 + 文本类」的响应压缩；
-// 压缩后反而更大的（如已压缩的图片）原样发送。
+// 传输时间与首屏都实打实变快。只对「声明支持 gzip + 体量够大 + 文本类」的响应压缩。
+// 2026-09-19 修正：改用**异步** zlib.gzip —— 早先用 gzipSync，几百 KB 的 JSON 会
+// 在主线程同步压几十毫秒，并发高时等于给事件循环上锁（自己引入的性能回归）。
 const GZIP_MIN_BYTES = 1024;
 // 文本类才压：png/jpg 本身已是压缩格式，再压纯属浪费 CPU
 const GZIP_TEXT_EXT = new Set([".html", ".js", ".css", ".json", ".svg",
   ".txt", ".xml", ".md", ".webmanifest", ".map", ".csv"]);
-function compressBody(req, buf, compressible) {
-  if (!compressible || buf.length < GZIP_MIN_BYTES) return { body: buf, headers: {} };
+function shouldGzip(req, buf, compressible) {
+  if (!compressible || buf.length < GZIP_MIN_BYTES) return false;
   const ae = String((req && req.headers && req.headers["accept-encoding"]) || "");
-  if (ae.indexOf("gzip") < 0) return { body: buf, headers: { Vary: "Accept-Encoding" } };
-  try {
-    const gz = zlib.gzipSync(buf, { level: 6 });
-    if (gz.length < buf.length) {
-      return { body: gz, headers: { "Content-Encoding": "gzip", "Vary": "Accept-Encoding" } };
+  return ae.indexOf("gzip") >= 0;
+}
+// 统一发送出口：必要时异步压缩，压完再决定 Content-Length / Content-Encoding。
+function sendBuffer(res, status, headers, buf, useGzip) {
+  const base = Object.assign({}, headers, { Vary: "Accept-Encoding" });
+  if (!useGzip) {
+    res.writeHead(status, Object.assign({}, base, { "Content-Length": String(buf.length) }));
+    return res.end(buf);
+  }
+  zlib.gzip(buf, { level: 6 }, function (err, gz) {
+    if (err || !gz || gz.length >= buf.length) {
+      res.writeHead(status, Object.assign({}, base, { "Content-Length": String(buf.length) }));
+      return res.end(buf);
     }
-  } catch (_) {}
-  return { body: buf, headers: { Vary: "Accept-Encoding" } };
+    res.writeHead(status, Object.assign({}, base, {
+      "Content-Encoding": "gzip",
+      "Content-Length": String(gz.length),
+    }));
+    res.end(gz);
+  });
 }
 
 function sendJSON(res, status, obj) {
   const buf = Buffer.from(JSON.stringify(obj), "utf-8");
-  const c = compressBody(res._req, buf, true);
   applySecurityHeaders(res);
-  res.writeHead(status, Object.assign({
+  sendBuffer(res, status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Content-Length": String(c.body.length),
-  }, c.headers));
-  res.end(c.body);
+  }, buf, shouldGzip(res._req, buf, true));
 }
 
 // 为耗时预测和路径查询输出可关联的单行结构化日志；响应只允许完成一次。
@@ -2141,15 +2260,12 @@ function serveStatic(req, res, pathname) {
     }
     const ext = path.extname(filePath).toLowerCase();
     applySecurityHeaders(res);
-    const c = compressBody(req, data, GZIP_TEXT_EXT.has(ext));
-    res.writeHead(200, Object.assign({
+    sendBuffer(res, 200, {
       "Content-Type": MIME[ext] || "application/octet-stream",
       // Frontend files are deployed in place; revalidate them so a new HTML
       // structure cannot be paired with a stale app.js in the browser cache.
       "Cache-Control": [".html", ".js", ".css"].includes(ext) ? "no-cache" : "public, max-age=86400",
-      "Content-Length": String(c.body.length),
-    }, c.headers));
-    res.end(c.body);
+    }, data, shouldGzip(req, data, GZIP_TEXT_EXT.has(ext)));
   });
 }
 
@@ -2486,6 +2602,22 @@ function handleRequest(req, res, parsed, pathname) {
       ok: !!JOURNEY_SOCKS5_HOST,
       detail: JOURNEY_SOCKS5_HOST ? (JOURNEY_SOCKS5_HOST + ":" + JOURNEY_SOCKS5_PORT) : "未配置（直连，bahnapp WAF 可能拦截）",
     };
+    // 5) 评论配图 EXIF 剥离能力（QA SEC-05 / LOW-07）
+    // 依赖 tools/strip_exif.py（PIL）。缺失时上传仍可用，但会静默跳过 GPS 剥离 ——
+    // 「隐私保护失效」这种事必须让运维看得见，所以单独列一项。
+    const exifScript = path.join(ROOT, "tools", "strip_exif.py");
+    const exifReady = fs.existsSync(exifScript);
+    out.checks.image_exif = {
+      ok: exifReady,
+      detail: exifReady
+        ? ("脚本就绪，python=" + PYTHON_BIN)
+        : "缺少 tools/strip_exif.py —— 上传将跳过 EXIF/GPS 剥离（降级放行）",
+    };
+    // 6) 注册图形验证码（QA SEC-01）
+    out.checks.captcha = {
+      ok: true,
+      detail: CAPTCHA_DISABLED ? "已关闭（CAPTCHA_DISABLED=1）" : "已启用（注册需图形验证码）",
+    };
     if (!writable) { out.status = "degraded"; }
     // ?deep=1 时同步探测 worker 端口，供运维/守护脚本快速判断
     if (parsed.query.deep === "1") {
@@ -2507,7 +2639,7 @@ function handleRequest(req, res, parsed, pathname) {
     const limitRaw = parseInt(parsed.query.limit, 10);
     const limit = Number.isFinite(limitRaw) ? limitRaw : 0;
     if (!train) {
-      return sendJSON(res, 400, { error: "缺少参数 train" });
+      return apiFail(res, 400, "E_MISSING_TRAIN", "缺少参数 train");
     }
     try {
       const result = queryDelay(train, limit);
@@ -2838,7 +2970,7 @@ function handleRequest(req, res, parsed, pathname) {
   if (pathname === "/api/journey/parse" && req.method === "GET") {
     if (rateLimited(res, "journey_parse", req)) return;
     const target = (parsed.query.url || "").trim();
-    if (!target) return sendJSON(res, 400, { error: "缺少参数 url" });
+    if (!target) return apiFail(res, 400, "E_MISSING_URL", "缺少参数 url");
     const dbJourney = parseDbFahrplanJourney(target);
     if (dbJourney) return sendJSON(res, 200, dbJourney);
     let dbUrl;
@@ -2918,7 +3050,7 @@ function handleRequest(req, res, parsed, pathname) {
       }
       return sendJSON(res, 200, loadImpactData());
     } catch (e) {
-      return sendJSON(res, 502, { error: "影响数据加载失败: " + e.message });
+      return apiFail(res, 502, "E_IMPACT_LOAD_FAIL", "影响数据加载失败: " + e.message);
     }
   }
 
@@ -3147,10 +3279,10 @@ function handleRequest(req, res, parsed, pathname) {
   if (pathname === "/api/lines") {
     const type = (parsed.query.type || "").trim().toUpperCase();
     if (!type) {
-      return sendJSON(res, 400, { error: "缺少参数 type" });
+      return apiFail(res, 400, "E_MISSING_TYPE", "缺少参数 type");
     }
     if (!timetable) {
-      return sendJSON(res, 503, { error: "时刻表未加载" });
+      return apiFail(res, 503, "E_TIMETABLE_NOT_LOADED", "时刻表未加载");
     }
     const set = new Set();
     // 防御：timetable 里部分服务的 train_type 标注不准（如 IC17 的 type 存成 RE），
@@ -3210,10 +3342,10 @@ function handleRequest(req, res, parsed, pathname) {
   if (pathname === "/api/services") {
     const line = (parsed.query.line || "").trim();
     if (!line) {
-      return sendJSON(res, 400, { error: "缺少参数 line" });
+      return apiFail(res, 400, "E_MISSING_LINE", "缺少参数 line");
     }
     if (!timetable) {
-      return sendJSON(res, 503, { error: "时刻表未加载" });
+      return apiFail(res, 503, "E_TIMETABLE_NOT_LOADED", "时刻表未加载");
     }
     try {
       const r = findServices(line, parsed.query.time, parsed.query.types);
@@ -3256,7 +3388,7 @@ function handleRequest(req, res, parsed, pathname) {
       }
       return sendJSON(res, 200, r);
     } catch (e) {
-      return sendJSON(res, 500, { error: "查询异常: " + e.message });
+      return apiFail(res, 500, "E_QUERY_FAILED", "查询异常: " + e.message);
     }
   }
 
@@ -3267,7 +3399,7 @@ function handleRequest(req, res, parsed, pathname) {
   if (pathname === "/api/ride-numbers") {
     const line = (parsed.query.line || "").trim();
     if (!line) {
-      return sendJSON(res, 400, { error: "缺少参数 line" });
+      return apiFail(res, 400, "E_MISSING_LINE", "缺少参数 line");
     }
     getRideNumbers(line, (err, numbers) => {
       if (err) return sendJSON(res, 502, { error: err.message });
@@ -3311,7 +3443,7 @@ function handleRequest(req, res, parsed, pathname) {
         return sendWriteError(res, e);
       }
       if (payload && payload.__tooLarge) {
-        return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内（可稍后重试，客户端会自动压缩）" });
+        return apiFail(res, 413, "E_BODY_TOO_LARGE", "内容过大：配图请控制在 3MB 以内（可稍后重试，客户端会自动压缩）");
       }
       // QA FUNC-08：文档/第三方调用多用 `text`，服务端只认 `content` → 400。
       // 两个字段名都收（content 优先），行为不变，接口更宽容。
@@ -3454,7 +3586,7 @@ function handleRequest(req, res, parsed, pathname) {
           return sendWriteError(res, e);
         }
         if (payload && payload.__tooLarge) {
-          return sendJSON(res, 413, { error: "内容过大：配图请控制在 3MB 以内" });
+          return apiFail(res, 413, "E_BODY_TOO_LARGE", "内容过大：配图请控制在 3MB 以内");
         }
         const text = String(firstDefined(payload && payload.content, payload && payload.text) || "").trim();
         const commitReply = function (imageUrl) {
@@ -3494,12 +3626,23 @@ function handleRequest(req, res, parsed, pathname) {
   }
 
   // ===================== 用户认证 =====================
-  // 注册（邮箱注册，无密码复杂度限制、无邮箱验证）
+  // 图形验证码：注册前先取一张（QA SEC-01）。答案只在服务端内存，前端只拿到 SVG。
+  if (pathname === "/api/captcha" && req.method === "GET") {
+    if (rateLimited(res, "captcha_get", req)) return;
+    if (CAPTCHA_DISABLED) return sendJSON(res, 200, { disabled: true });
+    const c = newCaptcha();
+    return sendJSON(res, 200, {
+      id: c.id, svg: captchaSvg(c.code), ttl_seconds: CAPTCHA_TTL_MS / 1000,
+    });
+  }
+
+  // 注册（邮箱注册，无邮箱验证；密码强度 + 图形验证码双重把关）
   if (pathname === "/api/register" && req.method === "POST") {
     if (rateLimited(res, "register", req)) return;
     readBody(req, (body) => {
       try {
-        const { email, password } = JSON.parse(body || "{}");
+        const payload = JSON.parse(body || "{}");
+        const email = payload.email, password = payload.password;
         const em = String(email || "").trim().toLowerCase();
         if (!EMAIL_RE.test(em)) {
           return apiFail(res, 400, "E_BAD_EMAIL", "邮箱格式不正确");
@@ -3511,6 +3654,15 @@ function handleRequest(req, res, parsed, pathname) {
         const pwIssue = passwordIssue(password);
         if (pwIssue) {
           return apiFail(res, 400, pwIssue, PASSWORD_RULE_MSG);
+        }
+        // 图形验证码（QA SEC-01）：放在格式/强度校验之后 —— 前者失败不该白白
+        // 消耗用户的一张验证码。校验通过即作废（一次性）。
+        const capIssue = verifyCaptcha(payload.captcha_id, payload.captcha_code);
+        if (capIssue) {
+          return apiFail(res, 400, capIssue,
+            capIssue === "E_CAPTCHA_REQUIRED" ? "请先获取图形验证码"
+              : capIssue === "E_CAPTCHA_EXPIRED" ? "验证码已过期，请点击图片刷新"
+              : "验证码不正确，请重新输入");
         }
         const users = loadUsers();
         if (users[em]) {
@@ -3636,7 +3788,7 @@ function handleRequest(req, res, parsed, pathname) {
             okData ? { record: enrichHistory(l2[i2]) }
                    : { error: errMsg || ("回填失败(exit " + code + ")") });
         }
-        return sendJSON(res, 404, { error: "记录不存在" });
+        return apiFail(res, 404, "E_HISTORY_NOT_FOUND", "记录不存在");
       };
       child.stdout.on("data", (c) => { stdout += c; });
       child.stderr.on("data", (c) => { stderr += c; });
@@ -3683,7 +3835,7 @@ function handleRequest(req, res, parsed, pathname) {
     req.on("end", () => {
       try {
         const id = String((JSON.parse(body || "{}").id) || "").slice(0, 64).trim();
-        if (!id) return sendJSON(res, 400, { error: "缺少 id" });
+        if (!id) return apiFail(res, 400, "E_MISSING_ID", "缺少 id");
         const v = loadVisitors();
         const now = Date.now();
         const TTL = 365 * 86400000; // 仅用于限制 ids 体积，count 保持单调累计

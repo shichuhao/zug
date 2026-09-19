@@ -532,7 +532,7 @@ document.addEventListener("keydown", function (e) {
   if (historyPanel && !historyPanel.classList.contains("hidden")) closeHistory();
 });
 
-initAuth();      // 绑定登录/注册/历史/登出事件（此前 Edit 评论区时误删了调用 → 按钮无响应）
+// initAuth() 已移至 auth.js 末尾（认证初始化属该模块职责，避免"改评论区把登录按钮搞坏"）
 initComments();
 
 // 访问人数统计：生成稳定 visitorId（localStorage 持久），首次访问上报后端去重计数

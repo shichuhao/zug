@@ -387,6 +387,7 @@
  <div class="modal-box share-box">
  <div class="modal-title"><span data-i18n="share.title">分享预测结果</span> <button id="shareModalClose" class="modal-x" type="button" title="关闭" aria-label="关闭" data-i18n-title="btn.close" data-i18n-aria="btn.close">×</button></div>
  <p id="shareModalTrain" class="share-train"></p>
+ <p id="shareTtlHint" class="share-ttl hidden"></p>
  <div class="share-link-row">
  <input id="shareLinkInput" class="share-link-input" type="text" readonly />
  <button id="shareCopyBtn" class="share-btn" type="button" data-i18n="share.copy">复制链接</button>
@@ -418,6 +419,12 @@
  </div>
  <input id="authEmail" type="email" placeholder="邮箱（如 name@example.com）" data-i18n-ph="auth.emailPlaceholder" autocomplete="email" />
  <input id="authPassword" type="password" placeholder="密码" data-i18n-ph="auth.passwordPlaceholder" autocomplete="current-password" />
+ <!-- 图形验证码：仅注册时需要（QA SEC-01 防脚本批量注册）；登录 tab 下隐藏 -->
+ <div id="authCaptchaRow" class="auth-captcha hidden">
+ <img id="authCaptchaImg" class="auth-captcha-img" width="140" height="51" alt="验证码" data-i18n-title="captcha.refreshTitle" data-i18n-aria="captcha.aria" title="点击刷新" />
+ <input id="authCaptchaInput" class="auth-captcha-input" type="text" maxlength="4" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="验证码" data-i18n-ph="captcha.placeholder" aria-label="验证码" />
+ <button id="authCaptchaRefresh" class="auth-captcha-refresh" type="button" data-i18n="captcha.refresh">换一张</button>
+ </div>
  <p id="authMsg" class="auth-msg"></p>
  <button id="authSubmit" class="auth-submit" type="submit" data-i18n="auth.tabLogin">登录</button>
  <p class="auth-note" data-i18n="auth.note">注册即创建本地账号：仅邮箱 + 密码，无需邮箱验证。</p>

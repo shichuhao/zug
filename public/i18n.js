@@ -74,6 +74,7 @@ const I18N = {
     "journey.openDb": "打开 DB 行程",
     "journey.parseFailed": "无法从该链接解析出行程，请粘贴行程文本。",
     "journey.sourceBlocked": "该链接的来源网站拒绝了我们的服务器访问（IP 被其风控拦截），与你贴的链接无关。请改用下方「粘贴行程文本」方式分析。",
+    "journey.linkExpired": "该行程链接已过期（bahnapp 的分享链接通常只在短期内有效）。请重新生成链接，或改用下方「粘贴行程文本」方式分析。",
     "journey.noLegs": "未解析出列车段，请检查链接或粘贴行程文本。",
     "predict.intervalLabel": "P10–P90 区间",
     "predict.prob15Label": "P(≥15 分)",
@@ -151,6 +152,7 @@ const I18N = {
     "share.whatsappText": "{{train}} 晚点预测： {{url}}",
     "share.telegramText": "列车晚点预测",
     "share.copy": "复制链接",
+    "share.ttlHint": "该链接 {{days}} 天后失效（{{date}}），到期后请重新分享。",
     "share.wx": "微信",
     "share.wa": "WhatsApp",
     "share.tg": "Telegram",
@@ -238,6 +240,13 @@ const I18N = {
     "swap.locked": "⚠️ 该车次的起终点来自车次数据（线路为单向），不能交换。如需站对站查询反方向，请先清空车次输入框，再手动填写起终点。",
     "auth.needEmailPw": "请输入邮箱和密码",
     "auth.pwRule": "密码需 8–128 位，且同时包含字母和数字",
+    "captcha.placeholder": "输入图中 4 位字符",
+    "captcha.refresh": "换一张",
+    "captcha.refreshTitle": "点击刷新验证码",
+    "captcha.aria": "图形验证码，点击可刷新",
+    "err.captcha_required": "请先获取图形验证码",
+    "err.captcha_invalid": "验证码不正确，请重新输入",
+    "err.captcha_expired": "验证码已过期，请点击图片刷新",
     "auth.fail": "操作失败，请重试",
     "auth.registerOk": "注册成功：",
     "auth.loginOk": "已登录：",
@@ -613,6 +622,7 @@ const I18N = {
     "journey.openDb": "Open DB journey",
     "journey.parseFailed": "Could not parse a journey from this link. Paste the journey text instead.",
     "journey.sourceBlocked": "The link's source site blocked our server (its anti-bot filter rejected our IP). This is unrelated to the link you pasted. Please use the paste-journey-text option below instead.",
+    "journey.linkExpired": "This journey link has expired (bahnapp share links are usually short-lived). Please generate a new link, or use the paste-journey-text option below.",
     "journey.noLegs": "No train legs found. Check the link or paste the journey text.",
     "predict.intervalLabel": "P10–P90 range",
     "predict.prob15Label": "P(≥15 min)",
@@ -690,6 +700,7 @@ const I18N = {
     "share.whatsappText": "{{train}} delay prediction: {{url}}",
     "share.telegramText": "Train delay prediction",
     "share.copy": "Copy link",
+    "share.ttlHint": "This link expires in {{days}} days ({{date}}); please share again afterwards.",
     "share.wx": "WeChat",
     "share.wa": "WhatsApp",
     "share.tg": "Telegram",
@@ -776,6 +787,13 @@ const I18N = {
     "swap.locked": "⚠️ This train's origin/destination come from train data (the line is one-way) and cannot be swapped. For the reverse direction, clear the train input first, then fill origin/destination manually.",
     "auth.needEmailPw": "Please enter email and password",
     "auth.pwRule": "Password must be 8–128 chars, with letters and digits",
+    "captcha.placeholder": "Enter the 4 characters",
+    "captcha.refresh": "New code",
+    "captcha.refreshTitle": "Click to refresh the code",
+    "captcha.aria": "Image CAPTCHA, click to refresh",
+    "err.captcha_required": "Please request an image code first",
+    "err.captcha_invalid": "Incorrect code, please try again",
+    "err.captcha_expired": "Code expired, click the image to refresh",
     "auth.fail": "Operation failed, please retry",
     "auth.registerOk": "Registered: ",
     "auth.loginOk": "Logged in: ",
@@ -1151,6 +1169,7 @@ const I18N = {
     "journey.openDb": "DB-Reise öffnen",
     "journey.parseFailed": "Aus diesem Link konnte keine Reise gelesen werden. Füge stattdessen den Reiseplantext ein.",
     "journey.sourceBlocked": "Die Quellseite des Links hat unseren Server blockiert (IP von deren Schutztfilter abgelehnt). Das liegt nicht an deinem Link. Bitte nutze unten die Option zum Einfügen des Reisetextes.",
+    "journey.linkExpired": "Dieser Reiselink ist abgelaufen (bahnapp-Links sind meist nur kurz gültig). Bitte erzeuge einen neuen Link oder nutze unten die Option zum Einfügen des Reisetextes.",
     "journey.noLegs": "Keine Zugabschnitte gefunden. Prüfe den Link oder füge den Reiseplantext ein.",
     "predict.intervalLabel": "P10–P90 Bereich",
     "predict.prob15Label": "P(≥15 Min)",
@@ -1228,6 +1247,7 @@ const I18N = {
     "share.whatsappText": "{{train}} Verspätungsprognose: {{url}}",
     "share.telegramText": "Zugverspätungsvorhersage",
     "share.copy": "Link kopieren",
+    "share.ttlHint": "Dieser Link läuft in {{days}} Tagen ab ({{date}}). Danach bitte erneut teilen.",
     "share.wx": "WeChat",
     "share.wa": "WhatsApp",
     "share.tg": "Telegram",
@@ -1314,6 +1334,13 @@ const I18N = {
     "swap.locked": "⚠️ Start/Ziel dieses Zugs stammen aus den Zugdaten (Linie ist Einbahnstraße) und können nicht getauscht werden. Für die Gegenrichtung zuerst das Zugfeld leeren, dann Start/Ziel manuell eingeben.",
     "auth.needEmailPw": "Bitte E-Mail und Passwort eingeben",
     "auth.pwRule": "Passwort: 8–128 Zeichen, mit Buchstaben und Zahlen",
+    "captcha.placeholder": "4 Zeichen eingeben",
+    "captcha.refresh": "Neuer Code",
+    "captcha.refreshTitle": "Klicken zum Aktualisieren",
+    "captcha.aria": "Bild-CAPTCHA, zum Aktualisieren klicken",
+    "err.captcha_required": "Bitte zuerst einen Bildcode anfordern",
+    "err.captcha_invalid": "Code falsch, bitte erneut eingeben",
+    "err.captcha_expired": "Code abgelaufen, bitte das Bild anklicken",
     "auth.fail": "Vorgang fehlgeschlagen, bitte erneut versuchen",
     "auth.registerOk": "Registriert: ",
     "auth.loginOk": "Angemeldet: ",
@@ -1757,6 +1784,18 @@ const SERVER_ERR_CODES = {
   E_RATE_LIMITED: "err.rate_limited",
   E_STORAGE_READONLY: "err.storage_readonly",
   E_INTERNAL: "err.generic",
+  // 参数/依赖类（2026-09-19 补齐：原先这些走中文串前缀匹配，文案一改就断）
+  E_MISSING_TRAIN: "err.missing_train",
+  E_MISSING_URL: "err.missing_url",
+  E_MISSING_TYPE: "err.missing_type",
+  E_MISSING_LINE: "err.missing_line",
+  E_TIMETABLE_NOT_LOADED: "err.timetable",
+  E_QUERY_FAILED: "err.routes_exception",
+  E_IMPACT_LOAD_FAIL: "err.impactLoadFail",
+  E_BODY_TOO_LARGE: "err.tooLarge",
+  E_CAPTCHA_REQUIRED: "err.captcha_required",
+  E_CAPTCHA_INVALID: "err.captcha_invalid",
+  E_CAPTCHA_EXPIRED: "err.captcha_expired",
 };
 const SERVER_ERR_MAP = {
   "缺少参数 train": "err.missing_train",
@@ -1800,8 +1839,9 @@ const SERVER_ERR_MAP = {
 };
 function localErrStr(s) {
   if (!s) return t("err.generic");
-  // 稳定错误码优先命中：不受服务端中文文案改动影响
-  if (typeof s === "string" && s.indexOf("E_") === 0 && SERVER_ERR_CODES[s]) {
+  // 稳定错误码优先命中（服务端 2026-09-18 起 error 字段统一为 E_XXX）：
+  // 不受服务端中文文案改动影响。对象查表而非前缀判断 —— 便于将来收编非 E_ 前缀的码。
+  if (typeof s === "string" && SERVER_ERR_CODES[s]) {
     return t(SERVER_ERR_CODES[s]);
   }
   if (SERVER_ERR_MAP[s]) return t(SERVER_ERR_MAP[s]);

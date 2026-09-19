@@ -107,6 +107,7 @@ function journeyErrorMessage(error) {
   // 链接被 bahnapp 侧风控拒绝（服务器 IP 被封，与用户输入的链接无关）：
   // 明确告知并直接引导改用文本粘贴，而不是含糊的「无法解析」。
   if (key === "journey_source_blocked") return t("journey.sourceBlocked");
+  if (key === "journey_link_expired") return t("journey.linkExpired");
   if (key === "journey_parse_failed") return t("journey.parseFailed");
   return key;
 }
@@ -431,7 +432,8 @@ shareBtn.addEventListener("click", async () => {
       return;
     }
     const full = location.origin + r.url;
-    await presentShareUrl(full, t("share.nativeTitle", { train: (currentData && currentData.train) || "" }), trigger);
+    await presentShareUrl(full, t("share.nativeTitle", { train: (currentData && currentData.train) || "" }), trigger,
+      { days: r.ttl_days, expiresAt: r.expires_at });
   } catch (e) {
     showShareTip(t("share.fail", { msg: e.message }), false);
   } finally {
@@ -459,6 +461,22 @@ function openShareModal(url, d, trigger) {
   if (dl) { dl.classList.add("hidden"); dl.removeAttribute("href"); }
   const st = document.getElementById("shareImgStatus");
   if (st) st.textContent = "";
+  // 快照类分享带 TTL 时明确告知失效时间（QA SEC-04：过期机制要对用户可见，
+  // 否则用户会以为链接永久有效，过几天失效时以为站点坏了）
+  const ttlEl = document.getElementById("shareTtlHint");
+  if (ttlEl) {
+    const ttl = d && d.ttl;
+    if (ttl && ttl.days) {
+      ttlEl.textContent = t("share.ttlHint", {
+        days: ttl.days,
+        date: String(ttl.expiresAt || "").slice(0, 10),
+      });
+      ttlEl.classList.remove("hidden");
+    } else {
+      ttlEl.textContent = "";
+      ttlEl.classList.add("hidden");
+    }
+  }
   modal._returnFocus = trigger || document.activeElement;
   modal._shareTarget = currentShareTarget(); // 图片生成目标跟随打开弹层时的栏
   modal.classList.remove("hidden");
@@ -608,7 +626,7 @@ function canNativeShareNow() {
   if (navigator.userActivation) return navigator.userActivation.isActive === true;
   return !_isIOS();
 }
-async function presentShareUrl(full, titleText, trigger) {
+async function presentShareUrl(full, titleText, trigger, ttlInfo) {
   if (canNativeShareNow()) {
     try {
       await navigator.share({ title: titleText, url: full });
@@ -618,7 +636,7 @@ async function presentShareUrl(full, titleText, trigger) {
       // NotAllowedError（手势过期）等异常 → 回退弹层
     }
   }
-  openShareModal(full, { train: titleText }, trigger);
+  openShareModal(full, { train: titleText, ttl: ttlInfo }, trigger);
 }
 
 // 站对站栏分享：参数链接（打开即自动重查并展示），图片分享渲染当前结果区
