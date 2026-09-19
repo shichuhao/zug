@@ -1298,20 +1298,89 @@ if (JOURNEY_SOCKS5) {
   }
 }
 
+// ── 行程抓取通道降级（2026-09-19）──────────────────────────────
+// 背景：SOCKS5 通道依赖 tailscale exit node（一台手机）。当手机掉线 / 未转发
+//      回包时，代理握手能成功但对**任意目标**都返回 REP=1，行程分析直接失败。
+//      旧逻辑 `if (err) return cb(err)` 无降级 —— 代理一坏，功能全废。
+//
+// 设计：把失败分成两类，只有「通道层失败」才降级：
+//   · 通道层（可降级）：TCP 连不上 / SOCKS5 握手异常 / 代理 REP≠0 / 代理超时 /
+//     DNS 失败 / TLS 握手失败 / 中转连不上。→ err.proxyUnavailable = true
+//   · 语义层（不降级）：HTTP 200 但是 WAF 拒绝页、4xx/5xx 业务响应、链接失效、
+//     解析失败、页面过大。→ 普通 Error（说明通道是通的，换出口也一样）
+//
+// 降级链：SOCKS5（住宅/移动 IP）→ 中转（机房 IP）→ 直连（部署机 IP）。
+// 可通过 JOURNEY_CHANNEL_FALLBACK 收窄（如设为 "socks" 表示禁止降级，
+// 避免绕过「运维故意启用代理」的意图 / 泄露部署机 IP）。
+const JOURNEY_CHANNEL_ERR = {
+  SOCKS_CONNECT_TIMEOUT: "journey_channel_socks_timeout",
+  SOCKS_CONNECT_FAIL: "journey_channel_socks_connect",
+  SOCKS_HANDSHAKE: "journey_channel_socks_handshake",
+  SOCKS_AUTH_REQUIRED: "journey_channel_socks_auth",
+  SOCKS_REJECTED: "journey_channel_socks_rejected",
+  DNS: "journey_channel_dns",
+  TLS: "journey_channel_tls",
+  RELAY_UNAVAILABLE: "journey_channel_relay_unavailable",
+};
+
+// 给 Error 打上「通道不可用」标记；降级判定**只认 proxyUnavailable**，
+// 绝不靠 message 字符串前缀（脆弱且易误判）。
+function channelError(code, msg) {
+  const e = new Error(msg || code);
+  e.code = code;
+  e.proxyUnavailable = true;
+  return e;
+}
+
+// SOCKS5 是**本机 127.0.0.1 端口**，正常握手是毫秒级；15s 纯属浪费（用户干等）。
+// 默认 4s，可用环境变量覆盖。
+const JOURNEY_PROXY_CONNECT_TIMEOUT_MS =
+  parseInt(process.env.JOURNEY_PROXY_CONNECT_TIMEOUT_MS || "", 10) || 4000;
+
+// 允许的降级链（默认全开）。运维可设 JOURNEY_CHANNEL_FALLBACK=socks 禁止降级。
+const JOURNEY_CHANNEL_FALLBACK = (process.env.JOURNEY_CHANNEL_FALLBACK || "socks,relay,direct")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
+// ── 代理健康度熔断（进程内，不持久化）─────────────────────────
+// 连续 N 次通道失败 → 冷却期内直接跳过 SOCKS（不再每次等超时）。
+// 冷却结束后进入「半开」：下一次请求会再试一次，成功即复位。
+const PROXY_FAIL_THRESHOLD = 3;
+const PROXY_COOLDOWN_MS = 60 * 1000;
+const _proxyHealth = { fails: 0, openUntil: 0, lastCode: null };
+function proxyCircuitOpen() { return Date.now() < _proxyHealth.openUntil; }
+function proxyNoteFailure(code) {
+  _proxyHealth.lastCode = code;
+  if (++_proxyHealth.fails >= PROXY_FAIL_THRESHOLD && !proxyCircuitOpen()) {
+    _proxyHealth.openUntil = Date.now() + PROXY_COOLDOWN_MS;
+    console.warn("[journey-channel] socks 熔断开启 " + PROXY_COOLDOWN_MS + "ms (last=" + code + ")");
+  }
+}
+function proxyNoteSuccess() { _proxyHealth.fails = 0; _proxyHealth.openUntil = 0; }
+
 // 通过 SOCKS5 建立到 host:port 的 TCP 连接，然后交给 https.request 复用。
 // 手写 SOCKS5 握手（无认证 + 域名寻址），避免引入第三方依赖。
 function socks5Connect(host, port, cb) {
   const net = require("net");
   const sock = net.connect(JOURNEY_SOCKS5_PORT, JOURNEY_SOCKS5_HOST);
   let stage = 0;
-  const fail = (msg) => { try { sock.destroy(); } catch (_) {} cb(new Error(msg)); };
-  sock.setTimeout(15000, () => fail("SOCKS5 连接超时"));
-  sock.on("error", (e) => cb(new Error("SOCKS5 连接失败: " + e.message)));
+  const fail = (msg) => { try { sock.destroy(); } catch (_) {} cb(msg instanceof Error ? msg : new Error(msg)); };
+  sock.setTimeout(JOURNEY_PROXY_CONNECT_TIMEOUT_MS,
+    () => fail(channelError(JOURNEY_CHANNEL_ERR.SOCKS_CONNECT_TIMEOUT, "SOCKS5 连接超时")));
+  sock.on("error", (e) => {
+    const code = /ENOTFOUND|EAI_AGAIN/.test(e.code || "")
+      ? JOURNEY_CHANNEL_ERR.DNS
+      : JOURNEY_CHANNEL_ERR.SOCKS_CONNECT_FAIL;
+    cb(channelError(code, "SOCKS5 连接失败: " + e.message));
+  });
   sock.on("data", (buf) => {
     if (stage === 0) {
       // 服务端方法选择应答：VER=5, METHOD=0(无需认证)
-      if (buf.length < 2 || buf[0] !== 0x05) return fail("SOCKS5 握手响应异常");
-      if (buf[1] !== 0x00) return fail("SOCKS5 要求认证（本实现仅支持免认证）");
+      if (buf.length < 2 || buf[0] !== 0x05) {
+        return fail(channelError(JOURNEY_CHANNEL_ERR.SOCKS_HANDSHAKE, "SOCKS5 握手响应异常"));
+      }
+      if (buf[1] !== 0x00) {
+        return fail(channelError(JOURNEY_CHANNEL_ERR.SOCKS_AUTH_REQUIRED, "SOCKS5 要求认证（本实现仅支持免认证）"));
+      }
       stage = 1;
       // 域名寻址，让代理解析 DNS
       const hb = Buffer.from(host, "utf8");
@@ -1323,7 +1392,8 @@ function socks5Connect(host, port, cb) {
     } else if (stage === 1) {
       // 连接应答：VER=5, REP=0 成功；跳过 BND.ADDR/BND.PORT
       if (buf.length < 2 || buf[1] !== 0x00) {
-        return fail("SOCKS5 代理拒绝连接 (REP=" + (buf[1] || "?") + ")");
+        return fail(channelError(JOURNEY_CHANNEL_ERR.SOCKS_REJECTED,
+          "SOCKS5 代理拒绝连接 (REP=" + (buf[1] || "?") + ")"));
       }
       stage = 2;
       sock.setTimeout(0);
@@ -1340,7 +1410,9 @@ function socks5Connect(host, port, cb) {
 function fetchJourneyViaSocks(target, cb, redirects) {
   let parsed;
   try { parsed = new URL(target); } catch (_) { return cb(new Error("无效的行程链接")); }
-  if (parsed.protocol !== "https:" || !["bahnapp.link", "bahnapp.online"].includes(parsed.hostname)) {
+  // 白名单与 fetchJourneyPage 保持一致（含 int.bahn.de）——否则降级到本通道时
+  // 目标会被本函数误判为「不支持的链接」而语义报错，白白丢掉一次机会。
+  if (parsed.protocol !== "https:" || !["bahnapp.link", "bahnapp.online", "int.bahn.de"].includes(parsed.hostname)) {
     return cb(new Error("仅支持 bahnapp.link 行程链接"));
   }
   const https = require("https");
@@ -1370,6 +1442,7 @@ function fetchJourneyViaSocks(target, cb, redirects) {
     // 那会让 'end' 先吃掉令牌，导致后续 finish 静默失效（请求永久挂起）。
     let settled = false;
     const finish = (...args) => { if (!settled) { settled = true; return cb(...args); } };
+    // 读取超时属于「通道建立后目标站太慢」，不是代理坏 → 不标 proxyUnavailable（不降级）。
     tlsSock.setTimeout(30000, () => { try { tlsSock.destroy(); } catch (_) {} finish(new Error("行程链接请求超时")); });
 
     // 全程用 Buffer 累积：HTTP 的 Content-Length / chunk-size 都是**字节**，
@@ -1384,7 +1457,8 @@ function fetchJourneyViaSocks(target, cb, redirects) {
         finish(new Error("行程页面过大"));
       }
     });
-    tlsSock.on("error", (e) => finish(new Error("行程抓取失败: " + e.message)));
+    // TLS 握手/传输失败 = 通道层失败（代理虽握手成功但 TLS 走不通）→ 可降级。
+    tlsSock.on("error", (e) => finish(channelError(JOURNEY_CHANNEL_ERR.TLS, "行程抓取失败: " + e.message)));
     tlsSock.on("end", () => {
       // 手动拆 HTTP 响应：状态行 + 头 + 空行 + body
       const sep = raw.indexOf(Buffer.from("\r\n\r\n"));
@@ -1445,10 +1519,11 @@ function fetchJourneyViaSocks(target, cb, redirects) {
 }
 
 // 通过中转抓取。返回 { html } 或抛错。
-function fetchJourneyViaRelay(target, cb) {
+// redirects 仅用于日志（跟随重定向由上游 Worker 负责），签名与其它通道对齐。
+function fetchJourneyViaRelay(target, cb, redirects) {
   let relayBase;
   try { relayBase = new URL(JOURNEY_RELAY_URL); } catch (_) {
-    return cb(new Error("中转地址配置无效"));
+    return cb(channelError(JOURNEY_CHANNEL_ERR.RELAY_UNAVAILABLE, "中转地址配置无效"));
   }
   const requestUrl = relayBase.toString().replace(/\/?$/, "/") +
     "?url=" + encodeURIComponent(target);
@@ -1458,12 +1533,17 @@ function fetchJourneyViaRelay(target, cb) {
   // 但本地联调/内网反代会用 http；写死 https 会抛 ERR_INVALID_PROTOCOL）
   const lib = relayBase.protocol === "http:" ? require("http") : require("https");
   const req = lib.get(requestUrl, { headers, timeout: 20000 }, (r) => {
-    if (r.statusCode === 401) { r.resume(); return cb(new Error("中转鉴权失败（token 不匹配）")); }
+    // 鉴权失败 / 中转本身报错 = 通道层失败 → 可降级
+    if (r.statusCode === 401) {
+      r.resume();
+      return cb(channelError(JOURNEY_CHANNEL_ERR.RELAY_UNAVAILABLE, "中转鉴权失败（token 不匹配）"));
+    }
     if (r.statusCode < 200 || r.statusCode >= 400) {
-      r.resume(); return cb(new Error("中转返回 HTTP " + r.statusCode));
+      r.resume();
+      return cb(channelError(JOURNEY_CHANNEL_ERR.RELAY_UNAVAILABLE, "中转返回 HTTP " + r.statusCode));
     }
     // Worker 会带这个头标明「CF 也取到了拒绝页」——说明 bahnapp 连 CF 的 IP 也封了，
-    // 与「链接本身失效」区分开，前端文案不同。
+    // 与「链接本身失效」区分开，前端文案不同。→ 语义失败，不降级。
     if (r.headers["x-relay-blocked"] === "1") {
       r.resume(); return cb(new Error("journey_source_blocked"));
     }
@@ -1476,33 +1556,25 @@ function fetchJourneyViaRelay(target, cb) {
     });
     stream.on("end", () => cb(null, body));
   });
-  req.on("timeout", () => req.destroy(new Error("中转请求超时")));
-  req.on("error", (e) => cb(new Error("中转请求失败: " + e.message)));
+  // 连不上中转 / 中转超时 = 通道层失败 → 可降级
+  req.on("timeout", () => req.destroy(channelError(JOURNEY_CHANNEL_ERR.RELAY_UNAVAILABLE, "中转请求超时")));
+  req.on("error", (e) => cb(e && e.proxyUnavailable
+    ? e : channelError(JOURNEY_CHANNEL_ERR.RELAY_UNAVAILABLE, "中转请求失败: " + e.message)));
 }
 
-// Fetch a public BahnApp share page. The page is treated as untrusted text;
-// only the allow-listed host is accepted and the response is size-limited.
-function fetchJourneyPage(target, cb, redirects) {
+// 直连抓取（部署机 IP）。与另两通道同构，支持重定向。
+function fetchJourneyViaDirect(target, cb, redirects) {
   let parsed;
   try { parsed = new URL(target); } catch (_) { return cb(new Error("无效的行程链接")); }
   if (parsed.protocol !== "https:" || !["bahnapp.link", "bahnapp.online", "int.bahn.de"].includes(parsed.hostname)) {
     return cb(new Error("仅支持 bahnapp.link 行程链接"));
-  }
-  // 优先级：SOCKS5 通道（住宅 IP，最不容易被 WAF 认出来）
-  //       > 中转服务（机房 IP，容易被封）
-  //       > 直连（部署机 IP 被 WAF 封时基本拿不到）
-  if (JOURNEY_SOCKS5_HOST) {
-    return fetchJourneyViaSocks(parsed.toString(), cb, 0);
-  }
-  if (JOURNEY_RELAY_ON) {
-    return fetchJourneyViaRelay(parsed.toString(), cb);
   }
   const https = require("https");
   const req = https.get(parsed, { headers: { "User-Agent": "TrainDelay/1.0", "Accept-Encoding": "identity" }, timeout: 15000 }, (r) => {
     if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && (redirects || 0) < 3) {
       r.resume();
       const next = new URL(r.headers.location, parsed).toString();
-      return fetchJourneyPage(next, cb, (redirects || 0) + 1);
+      return fetchJourneyViaDirect(next, cb, (redirects || 0) + 1);
     }
     if (r.statusCode < 200 || r.statusCode >= 400) {
       r.resume(); return cb(new Error("行程链接返回 HTTP " + r.statusCode));
@@ -1517,7 +1589,74 @@ function fetchJourneyPage(target, cb, redirects) {
     stream.on("end", () => cb(null, body));
   });
   req.on("timeout", () => req.destroy(new Error("行程链接请求超时")));
-  req.on("error", cb);
+  req.on("error", (e) => cb(channelError(JOURNEY_CHANNEL_ERR.TLS, "行程抓取失败: " + e.message)));
+}
+
+// 按配置计算本次可用的通道顺序（受 JOURNEY_CHANNEL_FALLBACK 收窄 + 熔断影响）。
+function journeyChannelPlan() {
+  const allow = JOURNEY_CHANNEL_FALLBACK;
+  const plan = [];
+  if (JOURNEY_SOCKS5_HOST && allow.includes("socks")) {
+    if (proxyCircuitOpen()) {
+      console.warn("[journey-channel] 跳过 socks（熔断中，last=" + _proxyHealth.lastCode + "）");
+    } else {
+      plan.push("socks");
+    }
+  }
+  if (JOURNEY_RELAY_ON && allow.includes("relay")) plan.push("relay");
+  if (allow.includes("direct")) plan.push("direct");
+  return plan;
+}
+
+// 按通道顺序尝试；**仅当 err.proxyUnavailable** 时降级到下一个通道。
+// 成功或语义失败（WAF 拒绝 / 链接失效 / 解析失败等）立即返回，不降级。
+function fetchJourneyByChannel(target, plan, idx, redirects, degraded, cb) {
+  if (idx >= plan.length) {
+    // 所有通道都不可用：返回最后一个通道错误（带码，供上层映射稳定错误码）
+    return cb(degraded.length
+      ? channelError(JOURNEY_CHANNEL_ERR.SOCKS_REJECTED, "所有行程抓取通道均不可用")
+      : new Error("行程抓取失败"));
+  }
+  const channel = plan[idx];
+  const onResult = (err, html) => {
+    if (err) {
+      if (err.proxyUnavailable) {
+        if (channel === "socks") proxyNoteFailure(err.code);
+        const next = plan[idx + 1];
+        console.warn("[journey-channel] " + JSON.stringify({
+          event: "degrade", from: channel, to: next || null,
+          reason: err.code, detail: String(err.message || ""),
+          ts: new Date().toISOString(),
+        }));
+        return fetchJourneyByChannel(target, plan, idx + 1, redirects, degraded.concat(channel), cb);
+      }
+      return cb(err); // 语义失败：不降级
+    }
+    if (channel === "socks") proxyNoteSuccess();
+    if (degraded.length) {
+      console.log("[journey-channel] " + JSON.stringify({
+        event: "success", channel: channel, degraded_from: degraded,
+      }));
+    }
+    cb(null, html, { channel: channel, degraded_from: degraded });
+  };
+  if (channel === "socks") return fetchJourneyViaSocks(target, onResult, redirects);
+  if (channel === "relay") return fetchJourneyViaRelay(target, onResult, redirects);
+  return fetchJourneyViaDirect(target, onResult, redirects);
+}
+
+// Fetch a public BahnApp share page. The page is treated as untrusted text;
+// only the allow-listed host is accepted and the response is size-limited.
+function fetchJourneyPage(target, cb, redirects) {
+  let parsed;
+  try { parsed = new URL(target); } catch (_) { return cb(new Error("无效的行程链接")); }
+  if (parsed.protocol !== "https:" || !["bahnapp.link", "bahnapp.online", "int.bahn.de"].includes(parsed.hostname)) {
+    return cb(new Error("仅支持 bahnapp.link 行程链接"));
+  }
+  // 通道降级链：SOCKS5（住宅/移动 IP）→ 中转（机房 IP）→ 直连（部署机 IP）
+  const plan = journeyChannelPlan();
+  if (!plan.length) return cb(new Error("未配置任何行程抓取通道"));
+  fetchJourneyByChannel(parsed.toString(), plan, 0, redirects || 0, [], cb);
 }
 
 function journeyPageText(html) {
@@ -2977,19 +3116,29 @@ function handleRequest(req, res, parsed, pathname) {
     try { dbUrl = new URL(target); } catch (_) { dbUrl = null; }
     if (dbUrl && /(^|\.)int\.bahn\.de$/i.test(dbUrl.hostname) && /^\/[^/]*\/buchung\/start$/i.test(dbUrl.pathname) && dbUrl.searchParams.get("vbid")) {
       return fetchDbVbid(dbUrl.searchParams.get("vbid"), (err, journey) => {
-        if (err) return sendJSON(res, 502, { error: err.message });
+        // 契约：error 字段只放稳定码，中文只进 message（前端 UI 不读 message，
+        // 因此不会泄漏中文），避免德语/英语界面弹出中文报错。
+        if (err) return apiFail(res, 502, "E_JOURNEY_FAILED", err.message);
         return sendJSON(res, 200, journey);
       });
     }
-    fetchJourneyPage(target, (err, html) => {
+    fetchJourneyPage(target, (err, html, meta) => {
       if (err) {
         // 中转检测到上游仍是拒绝页 → 与下面的 _denied 分支同样按 422 返回，
         // 让前端走 journey_source_blocked 的专用文案（含改用文本粘贴的引导）。
         if (err.message === "journey_source_blocked") {
           return sendJSON(res, 422, { error: "journey_source_blocked" });
         }
-        return sendJSON(res, 502, { error: err.message });
+        // 通道层失败（代理/中转/直连全不可用）→ 稳定码，前端本地化。
+        if (err.proxyUnavailable) {
+          return apiFail(res, 502, "E_JOURNEY_PROXY", err.message);
+        }
+        if (err.message === "行程链接请求超时") {
+          return apiFail(res, 502, "E_JOURNEY_TIMEOUT", err.message);
+        }
+        return apiFail(res, 502, "E_JOURNEY_FAILED", err.message);
       }
+      const channelMeta = meta ? { channel: meta.channel, degraded_from: meta.degraded_from } : {};
       const text = journeyPageText(html);
       if (process.env.JOURNEY_DEBUG) {
         console.log("[journey-debug] html字节=" + Buffer.byteLength(String(html || ""), "utf8") +
@@ -3031,7 +3180,12 @@ function handleRequest(req, res, parsed, pathname) {
         return sendJSON(res, 422, { error: dbBooking ? "journey_db_link_requires_text" : "journey_parse_failed" });
       }
       const dateMatch = text.match(/\b20\d{2}-\d{2}-\d{2}\b/);
-      return sendJSON(res, 200, { source: "bahnapp.link", text, date: dateMatch ? dateMatch[0] : "", legs });
+      return sendJSON(res, 200, Object.assign({
+        source: "bahnapp.link",
+        text,
+        date: dateMatch ? dateMatch[0] : "",
+        legs,
+      }, channelMeta));
     });
     return;
   }

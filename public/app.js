@@ -102,6 +102,8 @@ function journeyPercent(v) {
 }
 function journeyErrorMessage(error) {
   const key = String(error && error.message || error || "");
+  if (!key) return t("err.generic");
+  // journey 专属业务码：语义明确，有专属引导文案
   if (key === "journey_db_link_requires_text") return t("journey.dbLinkHint");
   if (key === "journey_db_link_open_required") return t("journey.dbOpenHint");
   // 链接被 bahnapp 侧风控拒绝（服务器 IP 被封，与用户输入的链接无关）：
@@ -109,7 +111,11 @@ function journeyErrorMessage(error) {
   if (key === "journey_source_blocked") return t("journey.sourceBlocked");
   if (key === "journey_link_expired") return t("journey.linkExpired");
   if (key === "journey_parse_failed") return t("journey.parseFailed");
-  return key;
+  // 其余（E_ 稳定码 / 中文原文 / 未知）：统一走既有的本地化机制。
+  // localErrStr 先查 SERVER_ERR_CODES（E_ 码）→ SERVER_ERR_MAP（中文串，最长前缀）
+  // → 含中文兜底为 err.generic。绝不再裸返中文原文。
+  const localized = localErrStr(key);
+  return localized || t("journey.failed");
 }
 function showJourneyDbOpenHint(url) {
   journeyStatus.innerHTML = escapeHtml(t("journey.dbOpenHint")) + ' <a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(t("journey.openDb")) + '</a>';

@@ -560,6 +560,7 @@ const I18N = {
     "err.history_not_found": "查询记录不存在或已被清理",
     "err.rate_limited": "操作过于频繁，请稍后再试",
     "err.storage_readonly": "存储暂时不可写，请稍后重试",
+    "err.proxyUnavailable": "行程来源暂时不可用（代理/网络通道故障）。请稍后重试，或改用下方「粘贴行程文本」方式分析。",
     "err.generic": "操作失败"
   },
 
@@ -1107,6 +1108,7 @@ const I18N = {
     "err.history_not_found": "History entry not found or already cleaned up",
     "err.rate_limited": "Too many requests, please try again later",
     "err.storage_readonly": "Storage temporarily read-only, please retry later",
+    "err.proxyUnavailable": "The journey source is temporarily unreachable (proxy/network channel failure). Please retry later, or use the paste-journey-text option below.",
     "err.generic": "Operation failed"
   },
 
@@ -1654,6 +1656,7 @@ const I18N = {
     "err.history_not_found": "Verlaufseintrag nicht gefunden oder bereits gelöscht",
     "err.rate_limited": "Zu viele Anfragen, bitte später erneut versuchen",
     "err.storage_readonly": "Speicher ist vorübergehend schreibgeschützt, bitte später erneut versuchen",
+    "err.proxyUnavailable": "Die Reisquelle ist vorübergehend nicht erreichbar (Proxy-/Netzwerkkanal fehlgeschlagen). Bitte später erneut versuchen oder unten die Option zum Einfügen des Reisetextes nutzen.",
     "err.generic": "Vorgang fehlgeschlagen"
   }
 };
@@ -1796,6 +1799,10 @@ const SERVER_ERR_CODES = {
   E_CAPTCHA_REQUIRED: "err.captcha_required",
   E_CAPTCHA_INVALID: "err.captcha_invalid",
   E_CAPTCHA_EXPIRED: "err.captcha_expired",
+  // 行程抓取（2026-09-19）：通道不可用 / 超时 / 其它失败
+  E_JOURNEY_PROXY: "err.proxyUnavailable",
+  E_JOURNEY_TIMEOUT: "err.requestTimeout",
+  E_JOURNEY_FAILED: "err.generic",
 };
 const SERVER_ERR_MAP = {
   "缺少参数 train": "err.missing_train",
@@ -1835,7 +1842,20 @@ const SERVER_ERR_MAP = {
   "实时事件查询超时": "err.liveTimeout",
   "实时事件解析失败": "err.liveParse",
   "查询失败": "err.queryFailRaw",
-  "内容过大": "err.tooLarge"
+  "内容过大": "err.tooLarge",
+  // 行程抓取通道类（2026-09-19）：后端可能把中文原文放进 error 的历史兼容路径。
+  // 按最长前缀匹配，命中后原文细节会作为 detail 追加。
+  "SOCKS5 代理拒绝连接": "err.proxyUnavailable",
+  "SOCKS5 连接超时": "err.proxyUnavailable",
+  "SOCKS5 连接失败": "err.proxyUnavailable",
+  "SOCKS5 握手响应异常": "err.proxyUnavailable",
+  "SOCKS5 要求认证": "err.proxyUnavailable",
+  "所有行程抓取通道均不可用": "err.proxyUnavailable",
+  "中转鉴权失败": "err.proxyUnavailable",
+  "中转返回 HTTP": "err.proxyUnavailable",
+  "中转请求超时": "err.proxyUnavailable",
+  "中转请求失败": "err.proxyUnavailable",
+  "中转地址配置无效": "err.proxyUnavailable"
 };
 function localErrStr(s) {
   if (!s) return t("err.generic");
@@ -1852,10 +1872,25 @@ function localErrStr(s) {
   }
   if (bestKey) {
     const base = t(SERVER_ERR_MAP[bestKey]);
-    const detail = s.slice(bestLen).replace(/^[:：\s]+/, "");
+    const detail = cleanErrDetail(s.slice(bestLen));
     return detail ? base + "：" + detail : base;
   }
+  // 兜底：未收录的**中文**原文绝不外泄（否则德语/英语界面会弹出中文）。
+  // 仅对含中文字符的串替换为通用文案；英文码 / URL / 纯数字等原样返回，
+  // 缩小回归面（这些本就该原样展示）。
+  if (/[\u4e00-\u9fff]/.test(s)) return t("err.generic");
   return s;
+}
+
+// 清洗「最长前缀匹配」后追加的 detail：
+// 后端错误串常为「前缀（含中文补充）」，如「中转鉴权失败（token 不匹配）」。
+// 前缀本身已被翻译，但括号里的中文若不剔除，仍会泄漏到德语/英语界面。
+// 规则：去掉中文字符及其包裹的括号，只保留有信息量的拉丁/数字细节。
+function cleanErrDetail(detail) {
+  if (!detail) return "";
+  let d = detail.replace(/[（(][^）)]*[\u4e00-\u9fff][^）)]*[）)]/g, " "); // 含中文的括号段
+  d = d.replace(/[\u4e00-\u9fff]+/g, " ");                              // 残余中文
+  return d.replace(/\s+/g, " ").replace(/^[:：\s]+|[\s]+$/g, "").trim();
 }
 
 // 当前语言的 BCP-47 locale（用于 toLocaleString）
