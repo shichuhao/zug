@@ -1707,13 +1707,27 @@ function parseDbReconJourney(rawGh, dateHint, serviceMap) {
   for (const record of rawGh.split(/[§¶]T/).slice(1)) {
     const stations = Array.from(record.matchAll(/(?:^|\$)A=1@O=([^@]+)@/g)).map((m) => m[1].trim());
     const times = record.match(/\$(\d{12})\$(\d{12})\$/);
-    // The train number is the only numeric field directly followed by "$$".
-    const train = record.match(/(\d+)\$\$/);
-    if (stations.length < 2 || !times || !train) continue;
+    // 车次字段紧跟在「出发时间$到达时间$」之后，格式为 `<空格填充><车次>$$`。
+    // 段尾还有 `$$<车厢数>$$$$$$` 等其它数字字段，必须锚定在时间之后取，
+    // 否则会把后面的 "1" 误当车次。
+    //
+    // 旧实现用 `/(\d+)\$\$/`（全记录内首次命中），有两个问题：
+    //   1) 带字母前缀的 S-Bahn（"S1"）被截成 "1" —— 该号不在 KCC 类别表
+    //      （KCC 只覆盖长途/区域列车），于是既无类别、又丢了前缀，输出裸 "1"；
+    //   2) 匹配位置不受锚定，遇到其它 `\$\$` 结构易误命中。
+    const trainTok = record.match(/\$\d{12}\$\d{12}\$\s*([A-Za-z]*\d+)\$\$/);
+    if (stations.length < 2 || !times || !trainTok) continue;
     const time = (value) => value.slice(8, 10) + ":" + value.slice(10, 12);
-    const category = (serviceMap && serviceMap[train[1]]) || "";
+    const raw = trainTok[1];
+    // 行内已带字母前缀（S1/RB23/…）时直接采用，勿再叠加 KCC 类别前缀。
+    const inlinePrefix = /^[A-Za-z]/.test(raw);
+    const number = raw.replace(/^[A-Za-z]+/, "");
+    const category = inlinePrefix ? "" : ((serviceMap && serviceMap[number]) || "");
     const prefix = { DRB: "RE", NRE: "RE", RE: "RE", RB: "RB", IC: "IC", ICE: "ICE", S: "S", BUS: "Bus" }[category] || category;
-    legs.push({ service: prefix ? prefix + " " + train[1] : train[1], from: stations[0], dep: time(times[1]), to: stations[1], arr: time(times[2]) });
+    const service = inlinePrefix
+      ? raw.toUpperCase()
+      : (prefix ? prefix + " " + number : number);
+    legs.push({ service, from: stations[0], dep: time(times[1]), to: stations[1], arr: time(times[2]) });
   }
   if (!legs.length) return null;
   const firstTime = rawGh.match(/\$(\d{12})\$/);
