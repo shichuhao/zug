@@ -115,6 +115,38 @@ const JOURNEY_LANE_MAX_WAIT_MS = (() => {
 const journeyLane = { active: 0, queue: [] };
 let _journeyLaneSeq = 0;
 
+// ── 在途行程腿实时跟踪（2026-09-20，供 /api/debug 任务视图）────────────
+// 记录每段行程腿从进入 → 排队/运行/调 worker → 完成/失败 的全生命周期，
+// 运维（和我）即可从 /api/debug 直接看到「哪段在跑、卡在哪」，不用猜。
+// 只跟踪「缓存未命中、真正打到 worker」的行程腿（缓存命中的即时返回，无需呈现）。
+const activeLegs = [];
+const recentLegs = [];
+let _legSeq = 0;
+function legTrackStart(train, rideFrom, rideTo, date) {
+  // 防御性裁剪：极端情况下（请求异常未收尾）避免 activeLegs 无限增长
+  if (activeLegs.length > 50) {
+    const cutoff = Date.now() - 120000;
+    for (let i = activeLegs.length - 1; i >= 0; i--) {
+      if (!activeLegs[i].done && activeLegs[i].startedAt < cutoff) activeLegs.splice(i, 1);
+    }
+  }
+  const e = { id: ++_legSeq, train, rideFrom, rideTo, date: date || "",
+              startedAt: Date.now(), laneWaitMs: 0, stage: "queued", done: false };
+  activeLegs.push(e);
+  return e;
+}
+function legTrackStage(e, stage) { if (e && !e.done) e.stage = stage; }
+function legTrackFinish(e, ok) {
+  if (!e || e.done) return;
+  e.done = true;
+  const i = activeLegs.indexOf(e);
+  if (i >= 0) activeLegs.splice(i, 1);
+  recentLegs.unshift(Object.assign({}, e, {
+    endedAt: Date.now(), latencyMs: Date.now() - e.startedAt, ok: !!ok,
+  }));
+  if (recentLegs.length > 12) recentLegs.length = 12;
+}
+
 // 取号并登记。返回 { id, waitMs }；等待超时返回 null（调用方应直接回 503）。
 function journeyLaneAcquire(cb) {
   if (journeyLane.active === 0) {
@@ -2863,6 +2895,10 @@ function handleRequest(req, res, parsed, pathname) {
     return sendJSON(res, out.status === "ok" ? 200 : 503, out);
   }
 
+  if (pathname === "/api/debug") {
+    return handleDebug(req, res, parsed);
+  }
+
   if (pathname === "/api/delay") {
     const train = parsed.query.train || "";
     const limitRaw = parseInt(parsed.query.limit, 10);
@@ -2921,20 +2957,28 @@ function handleRequest(req, res, parsed, pathname) {
     // 单条车次查询维持原行为（并发合并 → 超限即 503），避免影响压测结论。
     const isJourneyLeg = !!(rideFrom && rideTo);
     if (isJourneyLeg) {
+      const _leg = legTrackStart(train, rideFrom, rideTo, predictDate);
+      // 客户端中途断开：把在途腿标记为完成（失败），避免一直挂在活动列表里
+      req.on("close", function () { try { legTrackFinish(_leg, false); } catch (_) {} });
       return journeyLaneAcquire(function (ticket) {
         if (!ticket) {
+          legTrackStage(_leg, "lane_timeout");
+          legTrackFinish(_leg, false);
           res.setHeader("Retry-After", "5");
           return respond(503, { error: "预测服务繁忙，请稍后重试", retryable: true },
                   { source: "lane", reason: "lane_wait_timeout" });
         }
         if (ticket.waitMs > 0) res.setHeader("X-Queue-Wait", String(ticket.waitMs));
-        return runPredictionPath(ticket);
+        legTrackStage(_leg, ticket.waitMs > 0 ? "waiting_lane" : "running");
+        _leg.laneWaitMs = ticket.waitMs;
+        return runPredictionPath(ticket, _leg);
       });
     }
-    return runPredictionPath(null);
+    return runPredictionPath(null, null);
 
     // 预测主流程（缓存已在上面查过）。laneTicket 非空时表示持闸门，结束时必须释放。
-    function runPredictionPath(laneTicket) {
+    // leg：行程腿跟踪对象（非行程腿为 null），用于 /api/debug 呈现「哪段在跑」。
+    function runPredictionPath(laneTicket, leg) {
     let _laneReleased = false;
     const _releaseLane = function () {
       if (_laneReleased) return;
@@ -2989,6 +3033,9 @@ function handleRequest(req, res, parsed, pathname) {
     // 误、waiters 被静默丢弃 → 它们在压测里表现为「无响应直到浏览器超时」，
     // 比明确报错难排查得多，生产环境也是实打实的白等。
     const _failAll = function (code, payload, extra) {
+      // 行程腿跟踪：失败收尾
+      legTrackStage(leg, "failed");
+      legTrackFinish(leg, false);
       const st = trainInflight.get(inflightKey);
       const ws = (st && st.waiters) || [];
       _clearInflight();
@@ -3007,6 +3054,9 @@ function handleRequest(req, res, parsed, pathname) {
     // 抽出来是为了保证两条路径产出的对象结构 100% 一致（含 _query 回显、
     // 区间计算、走向防御标注、两级缓存写入），避免「走 worker 就少了字段」。
     const finishPrediction = function (data, extra) {
+      // 行程腿跟踪：成功收尾（worker / spawn 两条路径共用此函数）
+      legTrackStage(leg, "done");
+      legTrackFinish(leg, true);
       // 2026-09-11：成分拆解（breakdown）从同步链路拆出 → 独立懒加载端点
       // /api/breakdown。python 预测本身 10~40s，之前的 breakdown 计算（首次含
       // 19.9MB JSON 解析 + spawn station_to_region）叠在后面拖慢出结果；
@@ -3050,6 +3100,7 @@ function handleRequest(req, res, parsed, pathname) {
     if (PREDICTOR_WORKER_URL) {
       // 回调本身不是 async（避免改动整个 handler 的错误处理语义），这里用
       // Promise 链：worker 成功就收尾返回，失败/超时则回落到下面的 spawn 路径。
+      legTrackStage(leg, "worker");
       callPredictorWorker({ train, days, date: predictDate,
                             destination, rideFrom, rideTo, rideTime })
         .then(function (w) {
@@ -4525,3 +4576,74 @@ server.listen(PORT, () => {
   console.log(`示例: http://localhost:${PORT}/?train=ICE%20578`);
   cleanTrainDiskCache(); // 启动即清一次非当日预测缓存（次日自动失效的另一半）
 });
+
+// ── /api/debug：实时任务视图（2026-09-20）────────────────────────────────
+// 暴露后端正在跑什么：worker /health（在途预测数、就绪、累计）、行程车道状态、
+// 当前在途行程腿（哪段、卡在排队/调 worker、已耗时）、最近完成的腿，以及 server
+// 自身内存 + cgroup 占用。前端调试面板轮询它，后端状态一目了然。
+function handleDebug(req, res, parsed) {
+  const now = Date.now();
+  const mem = process.memoryUsage();
+  let cgCur = null, cgMax = null, worker = null;
+  try {
+    const c = parseInt(fs.readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim(), 10);
+    const m = fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+    if (!isNaN(c)) cgCur = c;
+    cgMax = (m === "max") ? null : (isNaN(parseInt(m, 10)) ? null : parseInt(m, 10));
+  } catch (_) { /* 探测不到就不阻塞 */ }
+
+  const done = function () {
+    const out = {
+      ok: true, time: new Date().toISOString(),
+      server: {
+        pid: process.pid, uptime_s: Math.round(process.uptime()),
+        rss_mb: Math.round(mem.rss / 1048576),
+        cgroup_mb: cgCur != null ? Math.round(cgCur / 1048576) : null,
+        cgroup_max_mb: cgMax != null ? Math.round(cgMax / 1048576) : null,
+        cgroup_pct: (cgCur && cgMax) ? Math.round(cgCur * 100 / cgMax) : null,
+      },
+      journeyLane: {
+        active: journeyLane.active,
+        queued: journeyLane.queue.length,
+        max_wait_ms: JOURNEY_LANE_MAX_WAIT_MS,
+      },
+      activeLegs: activeLegs.map(function (e) {
+        return { id: e.id, train: e.train, from: e.rideFrom, to: e.rideTo, date: e.date,
+                 stage: e.stage, lane_wait_ms: e.laneWaitMs, elapsed_ms: now - e.startedAt };
+      }),
+      recentLegs: recentLegs.map(function (e) {
+        return { id: e.id, train: e.train, from: e.rideFrom, to: e.rideTo, date: e.date,
+                 stage: e.stage, ok: e.ok, latency_ms: e.latencyMs, age_s: Math.round((now - e.endedAt) / 1000) };
+      }),
+      worker: worker,
+    };
+    sendJSON(res, 200, out);
+  };
+
+  // 代理 worker /health（带超时，不影响主流程）
+  const wkUrl = (PREDICTOR_WORKER_URL || "http://127.0.0.1:5099") + "/health";
+  let settled = false;
+  try {
+    const wr = http.get(wkUrl, function (r) {
+      let raw = "";
+      r.setEncoding("utf8");
+      r.on("data", function (d) { raw += d; });
+      r.on("end", function () {
+        try { worker = JSON.parse(raw); } catch (_) { worker = { ok: false, raw: raw.slice(0, 200) }; }
+        if (!settled) { settled = true; done(); }
+      });
+    });
+    wr.on("error", function () {
+      worker = { ok: false, error: "worker unreachable" };
+      if (!settled) { settled = true; done(); }
+    });
+    wr.setTimeout(1500, function () {
+      worker = { ok: false, error: "worker timeout" };
+      try { wr.destroy(); } catch (_) {}
+      if (!settled) { settled = true; done(); }
+    });
+  } catch (e) {
+    worker = { ok: false, error: String(e && e.message) };
+    if (!settled) { settled = true; done(); }
+  }
+}

@@ -158,23 +158,35 @@ async function predictJourney(legs, dateHint, signal) {
   // 行程腿串行队列），既不让请求白白被拒，又不会把栈堆到超时。
   const CONCURRENCY = 2;
   const predictions = new Array(legs.length);
+  // 进度展示：只统计「真正会发网络请求」的段（支持的车型），S/U/Bus 不计。
+  let totalToFetch = 0;
+  for (const leg of legs) { if (journeyPredictionUrl(leg, date)) totalToFetch++; }
+  let doneCount = 0;
+  const updateProgress = function () {
+    journeyStatus.textContent = t("journey.predictingProgress", { done: doneCount, total: totalToFetch });
+  };
+  updateProgress();
   let nextIdx = 0;
   const worker = async function () {
     while (true) {
       const i = nextIdx++;
       if (i >= legs.length) return;
       const leg = legs[i];
-      if (!journeyPredictionUrl(leg, date)) { predictions[i] = { error: "unsupported_service" }; continue; }
+      const url = journeyPredictionUrl(leg, date);
+      if (!url) { predictions[i] = { error: "unsupported_service" }; continue; }
       try {
         // 超时给到 180s：服务端排队是串行的（worker 并发上限 1），单段最坏
         // 30s 计算 + 前面几段排队累计，原先 35s 会让「排到了但还在算」的请求
         // 被前端自己掐掉，用户看到的就是满屏「无数据」而不是「超时」。
         // 服务端有 120s 的 worker 超时兜底，这里给足余量等它给出明确答复。
-        predictions[i] = await fetchJSON(journeyPredictionUrl(leg, date), { timeout: 180000, signal: signal });
+        predictions[i] = await fetchJSON(url, { timeout: 180000, signal: signal });
       } catch (e) {
         if (e && (e.name === "AbortError" || String(e).indexOf("AbortError") >= 0)) throw e; // 切页中止，静默
         predictions[i] = { error: queryTransportError(e) };
       }
+      // 每段完成即刻刷新进度，慢一段也不会像冻住
+      doneCount++;
+      updateProgress();
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, legs.length) }, worker));
@@ -4165,4 +4177,129 @@ function applyTheme(theme) {
       applyTheme(next);
     });
   }
+})();
+
+/* ── 后端实时状态面板（2026-09-20，调试用）──────────────────────────────
+ * 轮询 /api/debug，展示 worker / 行程车道 / 在途&最近行程腿 / 内存占用。
+ * 折叠在右下角，点 ⚙ 后端 展开。仅开发/排障用，不影响正常功能与布局。 */
+(function () {
+  if (document.getElementById("debugPanel")) return; // 防重复注入
+  var T = (typeof t === "function") ? t : function (k) { return k; };
+
+  var CSS = [
+    ".debug-open{position:fixed;right:12px;bottom:12px;z-index:9999;background:#1f2937;color:#e5e7eb;",
+    "border:1px solid #374151;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer;opacity:.85}",
+    ".debug-open:hover{opacity:1}",
+    ".debug-panel{position:fixed;right:12px;bottom:48px;z-index:9999;width:320px;max-height:70vh;overflow:auto;",
+    "background:#0f172a;color:#cbd5e1;border:1px solid #334155;border-radius:10px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;",
+    "box-shadow:0 8px 24px rgba(0,0,0,.4)}",
+    ".debug-panel.hidden{display:none}",
+    ".debug-head{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid #334155;",
+    "position:sticky;top:0;background:#0f172a;font-weight:600;color:#e2e8f0}",
+    ".debug-head button{background:none;border:none;color:#94a3b8;font-size:16px;cursor:pointer;line-height:1}",
+    ".debug-body{padding:8px 10px}",
+    ".debug-sec{margin-bottom:10px}",
+    ".debug-sec h4{margin:0 0 4px;font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}",
+    ".debug-row{display:flex;justify-content:space-between;gap:8px}",
+    ".debug-bar{height:6px;background:#1e293b;border-radius:3px;overflow:hidden;margin:3px 0 6px}",
+    ".debug-bar>i{display:block;height:100%;background:#22c55e}",
+    ".debug-bar>i.warn{background:#f59e0b}.debug-bar>i.crit{background:#ef4444}",
+    ".debug-leg{padding:3px 0;border-top:1px dashed #1e293b}",
+    ".debug-leg .s-queued{color:#94a3b8}.debug-leg .s-running,.debug-leg .s-worker{color:#38bdf8}",
+    ".debug-leg .s-done{color:#22c55e}.debug-leg .s-failed,.debug-leg .s-lane_timeout{color:#ef4444}",
+    ".debug-leg .s-waiting_lane{color:#f59e0b}",
+    ".debug-empty{color:#64748b;font-style:italic}"
+  ].join("");
+  var style = document.createElement("style");
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  var openBtn = document.createElement("button");
+  openBtn.id = "debugOpen";
+  openBtn.className = "debug-open";
+  openBtn.textContent = T("debug.open");
+  document.body.appendChild(openBtn);
+
+  var panel = document.createElement("div");
+  panel.id = "debugPanel";
+  panel.className = "debug-panel hidden";
+  panel.innerHTML =
+    '<div class="debug-head"><span id="debugTitle"></span><button id="debugClose" title="关闭">×</button></div>' +
+    '<div class="debug-body" id="debugBody"></div>';
+  document.body.appendChild(panel);
+
+  document.getElementById("debugTitle").textContent = T("debug.title");
+
+  var body = document.getElementById("debugBody");
+  var open = false, timer = null;
+  var STAGE = { queued: "排队中", waiting_lane: "车道排队", running: "运行中",
+                worker: "调worker", done: "完成", failed: "失败", lane_timeout: "车道超时" };
+
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function fmtMs(ms) { return ms == null ? "-" : (ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms"); }
+
+  function render(d) {
+    if (!d || !d.ok) { body.innerHTML = '<div class="debug-empty">无法获取后端状态</div>'; return; }
+    var s = d.server || {}, w = d.worker || {}, lane = d.journeyLane || {};
+    var pct = s.cgroup_pct, barCls = pct >= 95 ? "crit" : (pct >= 85 ? "warn" : "");
+    var html = "";
+    html += '<div class="debug-sec"><h4>' + esc(T("debug.memory")) + ' / cgroup</h4>' +
+      '<div class="debug-bar"><i class="' + barCls + '" style="width:' + (pct || 0) + '%"></i></div>' +
+      '<div class="debug-row"><span>' + (s.cgroup_mb || "?") + ' / ' + (s.cgroup_max_mb || "?") + ' MB</span>' +
+      '<span>' + (pct || "?") + '%</span></div>' +
+      '<div class="debug-row"><span>rss ' + (s.rss_mb || "?") + ' MB</span>' +
+      '<span>' + T("debug.uptime") + ' ' + Math.floor((s.uptime_s || 0) / 60) + 'm</span></div></div>';
+    var wbusy = (w.in_use || 0) > 0;
+    html += '<div class="debug-sec"><h4>' + esc(T("debug.worker")) + '</h4>' +
+      '<div class="debug-row"><span>' + (w.ready === false ? T("debug.notReady") : T("debug.ready")) + ' · ' +
+      (w.in_use || 0) + '/' + (w.max_concurrency || 0) + ' 在途</span>' +
+      '<span style="color:' + (wbusy ? "#38bdf8" : "#22c55e") + '">' + (wbusy ? T("debug.busy") : T("debug.idle")) + '</span></div>' +
+      '<div class="debug-row"><span>' + T("debug.served") + ' ' + (w.served || 0) + '</span>' +
+      '<span>失败 ' + (w.failed || 0) + ' · 均 ' + fmtMs(w.avg_ms) + '</span></div></div>';
+    html += '<div class="debug-sec"><h4>' + esc(T("debug.lane")) + '</h4>' +
+      '<div class="debug-row"><span>占用 ' + (lane.active || 0) + ' · 排队 ' + (lane.queued || 0) + '</span>' +
+      '<span>' + T("debug.laneWait") + ' ' + Math.round((lane.max_wait_ms || 0) / 1000) + 's</span></div></div>';
+    html += '<div class="debug-sec"><h4>' + esc(T("debug.active")) + '</h4>';
+    var al = d.activeLegs || [];
+    if (!al.length) html += '<div class="debug-empty">'+T("debug.none")+'</div>';
+    else al.forEach(function (l) {
+      html += '<div class="debug-leg"><div class="debug-row"><span><b>' + esc(l.train) + '</b> ' +
+        esc(l.from) + ' → ' + esc(l.to) + '</span><span class="s-' + l.stage + '">' +
+        (STAGE[l.stage] || l.stage) + '</span></div>' +
+        '<div class="debug-row"><span style="color:#64748b">耗时 ' + fmtMs(l.elapsed_ms) + '</span>' +
+        (l.lane_wait_ms ? '<span style="color:#64748b">排队 ' + fmtMs(l.lane_wait_ms) + '</span>' : '') + '</div></div>';
+    });
+    html += '</div>';
+    html += '<div class="debug-sec"><h4>' + esc(T("debug.recent")) + '</h4>';
+    var rl = d.recentLegs || [];
+    if (!rl.length) html += '<div class="debug-empty">'+T("debug.none")+'</div>';
+    else rl.slice(0, 6).forEach(function (l) {
+      html += '<div class="debug-leg"><div class="debug-row"><span><b>' + esc(l.train) + '</b> ' +
+        esc(l.from) + ' → ' + esc(l.to) + '</span><span class="s-' + l.stage + '">' +
+        (l.ok ? "OK " : "ERR ") + (STAGE[l.stage] || l.stage) + '</span></div>' +
+        '<div class="debug-row"><span style="color:#64748b">' + fmtMs(l.latency_ms) + ' · ' +
+        (l.age_s || 0) + 's前</span></div></div>';
+    });
+    html += '</div>';
+    body.innerHTML = html;
+  }
+
+  function poll() {
+    if (!open) return;
+    fetch("/api/debug", { cache: "no-store" }).then(function (r) { return r.json(); })
+      .then(function (d) { render(d); })
+      .catch(function () { body.innerHTML = '<div class="debug-empty">请求失败</div>'; });
+  }
+  function start() { if (timer) return; timer = setInterval(poll, 1500); poll(); }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  openBtn.addEventListener("click", function () {
+    open = !open;
+    panel.classList.toggle("hidden", !open);
+    if (open) start(); else stop();
+  });
+  document.getElementById("debugClose").addEventListener("click", function () {
+    open = false; panel.classList.add("hidden"); stop();
+  });
 })();
