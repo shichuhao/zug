@@ -1803,6 +1803,8 @@ const SERVER_ERR_CODES = {
   E_JOURNEY_PROXY: "err.proxyUnavailable",
   E_JOURNEY_TIMEOUT: "err.requestTimeout",
   E_JOURNEY_FAILED: "err.generic",
+  // 前端网络层（fetchJSON 按 code 归一：无 message 时用它映射，避免显示 "Error"）
+  E_TIMEOUT: "err.requestTimeout",
 };
 const SERVER_ERR_MAP = {
   "缺少参数 train": "err.missing_train",

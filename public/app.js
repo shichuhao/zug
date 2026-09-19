@@ -100,9 +100,25 @@ function journeyTextDate(text) {
 function journeyPercent(v) {
   return v == null || !Number.isFinite(Number(v)) ? t("journey.noData") : Math.round(Math.min(1, Math.max(0, Number(v))) * 100) + "%";
 }
+// 从异常中提取「可映射的 key」：优先 message，其次 code（fetchJSON 对网络/超时
+// 等失败只设 code，message 为空 —— 此时 String(err) 会退化成 "Error"）。
+function errorMessageKey(error) {
+  if (error == null) return "";
+  const msg = error && error.message ? String(error.message).trim() : "";
+  if (msg) return msg;
+  const code = error && error.code ? String(error.code).trim() : "";
+  if (code === "timeout") return "E_TIMEOUT";
+  if (code === "network" || code === "invalid_response" || code === "http_server") return "";
+  // 兜底：非空 code 直接返回（可被 localErrStr/SERVER_ERR_CODES 命中）
+  return code;
+}
 function journeyErrorMessage(error) {
-  const key = String(error && error.message || error || "");
-  if (!key) return t("err.generic");
+  // 注意：fetchJSON 在「网络失败 / 超时 / 非 JSON 响应」等路径抛的是
+  // **无 message 的 Error**（见 fetchJSON 的 new Error()），此时
+  // String(err) 得到的是字面量 "Error" 或空串 —— 直接交给下方映射会显示
+  // 无意义的「Error」。先在源头识别并归入网络类提示。
+  const key = errorMessageKey(error);
+  if (!key || key === "Error") return t("err.networkUnavailable");
   // journey 专属业务码：语义明确，有专属引导文案
   if (key === "journey_db_link_requires_text") return t("journey.dbLinkHint");
   if (key === "journey_db_link_open_required") return t("journey.dbOpenHint");
@@ -3080,7 +3096,7 @@ async function fetchJSON(url, opts) {
     // credentials: "same-origin" —— 让 httpOnly 会话 Cookie 随请求发出（登录态的关键）
     var resp = await fetch(url, Object.assign({}, opt, { headers: headers, signal: controller.signal, credentials: "same-origin" }));
     if (!resp.ok) {
-      var httpError = new Error();
+      var httpError = new Error("HTTP " + resp.status);
       httpError.status = resp.status;
       httpError.code = resp.status === 429 ? "http_rate_limited" : resp.status >= 500 ? "http_server" : "http_error";
       try {
@@ -3094,19 +3110,19 @@ async function fetchJSON(url, opts) {
     }
     const text = await resp.text();
     if (!text.trim()) {
-      var emptyResponseError = new Error();
+      var emptyResponseError = new Error("empty response");
       emptyResponseError.code = "invalid_response";
       throw emptyResponseError;
     }
     try { return JSON.parse(text); }
     catch (_) {
-      var parseError = new Error();
+      var parseError = new Error("invalid JSON response");
       parseError.code = "invalid_response";
       throw parseError;
     }
   } catch (err) {
     if (err && err.code) throw err;
-    var requestError = new Error();
+    var requestError = new Error(timedOut ? "request timeout" : "network error");
     requestError.code = timedOut ? "timeout" : externalSignal && externalSignal.aborted ? "aborted" : "network";
     throw requestError;
   } finally {
