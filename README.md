@@ -51,5 +51,42 @@ worker 不可达时**会静默降级**为每请求 fork 一个 python（冷查�
   对 zugfinder 不覆盖的车次（境外车、不存在车次）已加快速失败：
   连续 `ZUGFINDER_EMPTY_ACCOUNT_LIMIT`（默认 3）个账号「登录成功、未限流、
   但零数据」即判定不覆盖并提前收工，实测 45–56s → 9–15s。
-- **行程抓取（bahnapp.link）依赖住宅 IP 出口**：该站用 CloudFront WAF 按来源 IP
-  封禁，机房 IP 会拿到拒绝页。当前走 `ZUGFINDER_SOCKS5` 配置的中转出口。
+- **行程抓取（bahnapp.link）依赖非中国大陆的住宅/移动 IP 出口**：该站用 CloudFront
+  WAF 按**客户端出口 IP** 封禁。沙箱直连出口是腾讯云 CN（AS45090），必拿到拒绝页；
+  需经 `ZUGFINDER_SOCKS5`（住宅/移动 IP）出去。**出口池 + 自动故障转移**见下节。
+
+### 行程抓取出口池（多出口冗余 + 主动探测）
+
+**为什么需要**：唯一可用出口曾是一台德国手机（Tailscale exit node）。手机一离线，
+行程抓取就彻底挂 —— 单点。现在把出口做成**池**，任一出口失效自动切下一个。
+
+**配置**（`.env`，细节见 `.env.example`）：
+
+```bash
+ZUGFINDER_SOCKS5=#k30pro@socks5h://127.0.0.1:1080          # 主出口
+ZUGFINDER_SOCKS5_EXTRA=#note12@socks5h://127.0.0.1:1081    # 追加出口（逗号分隔，必须单行）
+JOURNEY_CHANNEL_FALLBACK=socks,relay                        # 不含 direct（直连必被拦）
+```
+
+**行为**：
+- 按池顺序尝试出口；**逐出口熔断**（连续 3 次通道失败 → 该出口冷却 60s，其他出口不受影响）。
+- **只**在通道层失败（连不上/握手失败/DNS/TLS）时切换出口；语义失败（WAF 拒绝页、
+  链接失效、解析失败）**不**切换 —— 换出口也一样，避免空转。
+- 所有出口 + relay 都不可用 → 返回 `502 E_JOURNEY_PROXY`（含 `channel_code` 与
+  `tried`），**不回退直连**（直连只会被 WAF 拦，给出误导性结果）。
+- **主动探测**：每 90s 用真实业务路径探活各出口，提前把掉线出口标为不健康，
+  故障转移瞬时发生（熔断中的出口跳过，健康出口降频，对目标站友好）。
+
+**观测**：
+- `GET /api/debug` → `journeyChannels`：每个出口的 `state / circuit_open / fails /
+  last_code / last_ok_age_s / served`，`stats`（成功/降级/全失败计数），`recent`（最近通道事件）。
+- `GET /api/health` → `checks.journey_proxy`：出口池整体健康 + 各出口状态。
+
+**可能的备用出口**（任选，配置即成，互不冲突）：
+1. 第二台手机作 Tailscale exit node → 填入 `ZUGFINDER_SOCKS5_EXTRA`。
+2. 家里常开机器跑住宅出口 agent（反向 WS 隧道，住宅 IP 出口，最稳）。
+3. 自有德国 VPS / 住宅 SOCKS5 地址。
+
+> ⚠️ **反模式（已逐一实测证伪，勿重试）**：bahnapp 的封锁是**纯客户端 IP 判定**。
+> 改 `hosts`、逐个换 CloudFront 边缘 IP、伪造 User-Agent / `Accept-Language: de-DE`
+> —— 全部无效。唯一出路是换一个非中国大陆的出口 IP。

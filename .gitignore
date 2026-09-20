@@ -7,7 +7,9 @@ secrets/
 *.bak-*
 .env
 .env.*
-!.env.example          # 示例模板不含真实值，保留
+# 示例模板不含真实值，保留（注意：gitignore 不支持行内注释，
+# 下面的 '#' 必须独占一行，否则整行会被当作注释而使规则失效）
+!.env.example
 *.pem
 *.key
 *.p12

@@ -1383,28 +1383,96 @@ if (JOURNEY_RELAY_URL) {
   }
 }
 
-// ── SOCKS5 直连通道（2026-09-16）─────────────────────────────
+// ── 行程出口池（SOCKS5，2026-09-16 引入，2026-09-21 多出口化）────────
 // 场景：部署机 IP 被封，中转服务（CF/Deno）的机房 IP 也被封，
 //      唯一能出的是住宅/移动 IP。把 tailscale 的 userspace SOCKS5
 //      （127.0.0.1:1080 —— 出口指向一台手机）当作通道即可。
 //
-//   ZUGFINDER_SOCKS5 = socks5h://127.0.0.1:1080
+//   ZUGFINDER_SOCKS5       = socks5h://127.0.0.1:1080            （主出口，向后兼容）
+//   ZUGFINDER_SOCKS5_EXTRA = #note12@127.0.0.1:1081,#vps@...    （追加出口，逗号分隔）
 //
 // 用 socks5h 让域名在代理解析（本机 DNS 可能被污染）。
-// 未配置时行为与从前完全一致。
-const JOURNEY_SOCKS5 = (process.env.ZUGFINDER_SOCKS5 || "").trim();
-let JOURNEY_SOCKS5_HOST = null, JOURNEY_SOCKS5_PORT = 0;
-if (JOURNEY_SOCKS5) {
-  try {
-    const _su = new URL(JOURNEY_SOCKS5);
-    if (!/^socks5h?:$/.test(_su.protocol)) throw new Error("协议必须是 socks5: 或 socks5h:");
-    JOURNEY_SOCKS5_HOST = _su.hostname;
-    JOURNEY_SOCKS5_PORT = parseInt(_su.port, 10) || 1080;
-    console.log("[socks5] 行程抓取走代理: " + JOURNEY_SOCKS5_HOST + ":" + JOURNEY_SOCKS5_PORT);
-  } catch (e) {
-    console.error("[socks5] ZUGFINDER_SOCKS5 无效，已忽略并回退直连: " + e.message);
+//
+// ⚠️ 单点问题（2026-09-21）：唯一出口 = 一台德国手机，手机一离线行程抓取就全废。
+//    故升级为「出口池」：任一出口挂掉自动切下一个，池里还有活的就不中断。
+//
+// ⚠️ 反模式（已逐一实测证伪，勿重试）：
+//    bahnapp 用 CloudFront WAF 按【客户端出口 IP】封禁，与目标 IP / 请求头无关。
+//    · 改 hosts、换 CloudFront 边缘 IP（13.33.187.x 逐个 --resolve）→ 全被拦；
+//    · 伪造 iPhone UA / Accept-Language: de-DE → 仍被拦；
+//    · 沙箱直连出口是腾讯云 CN（AS45090）→ 必拦；住宅/移动 IP（如 DE 1&1）→ 放行。
+//    结论：改 host / 换 IP / 改请求头都无效，唯一出路是换非中国大陆的出口 IP。
+
+const ZUGFINDER_SOCKS5_MAIN = (process.env.ZUGFINDER_SOCKS5 || "").trim();
+const ZUGFINDER_SOCKS5_EXTRA = (process.env.ZUGFINDER_SOCKS5_EXTRA || "").trim();
+// 池开关：=0 时忽略 EXTRA，退回「只用主出口」的旧行为。
+const JOURNEY_SOCKS_POOL_ON = !/^(0|false|no|off)$/i.test((process.env.JOURNEY_SOCKS_POOL_ON || "1").trim());
+// 逐出口连接超时（SOCKS5 是本机/内网端口，正常握手毫秒级）。默认 4s。
+const JOURNEY_PROXY_CONNECT_TIMEOUT_MS =
+  parseInt(process.env.JOURNEY_PROXY_CONNECT_TIMEOUT_MS || "", 10) || 4000;
+
+// 解析单个出口串（形如 "[#名称@]socks5h://host:port" 或裸 "host:port"）。
+// 返回 { id, host, port, url } 或 null（非法项打印告警但不抛 —— 配错不打死功能）。
+function _parseOneEgress(raw, fallbackId, usedKeys) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  // 前缀 #名称@
+  let id = fallbackId, body = s;
+  const m = s.match(/^#([A-Za-z0-9_.\-]{1,24})@(.+)$/);
+  if (m) { id = m[1]; body = m[2].trim(); }
+  // 无 scheme 时补 socks5h://（便于写 "127.0.0.1:1081"）
+  if (!/^socks5h?:\/\//i.test(body)) body = "socks5h://" + body.replace(/^\/+/, "");
+  let u;
+  try { u = new URL(body); } catch (e) {
+    console.error("[socks5] 出口解析失败，已跳过: " + s + " (" + e.message + ")");
+    return null;
   }
+  if (!/^socks5h?:$/.test(u.protocol)) {
+    console.error("[socks5] 出口协议必须是 socks5: 或 socks5h:，已跳过: " + s);
+    return null;
+  }
+  const host = u.hostname, port = parseInt(u.port, 10) || 1080;
+  const key = host + ":" + port;
+  if (usedKeys && usedKeys.has(key)) return null; // 按 host:port 去重
+  if (usedKeys) usedKeys.add(key);
+  return { id: id, host: host, port: port, url: "socks5h://" + host + ":" + port };
 }
+
+// 出口池：顺序即尝试顺序。每个出口独立健康状态（逐出口熔断）。
+const _journeyEgresses = [];
+// 兼容旧读取点（/api/health 等曾读这两个变量）：指向池中第一个出口。
+let JOURNEY_SOCKS5_HOST = null, JOURNEY_SOCKS5_PORT = 0;
+
+(function initJourneyEgresses() {
+  const used = new Set();
+  const main = _parseOneEgress(ZUGFINDER_SOCKS5_MAIN, "socks-1", used);
+  if (main) _journeyEgresses.push(main);
+  if (JOURNEY_SOCKS_POOL_ON && ZUGFINDER_SOCKS5_EXTRA) {
+    // 兼容外部注入的多行 env：同时按换行/逗号/空白分隔
+    ZUGFINDER_SOCKS5_EXTRA.split(/[\n,]+/).forEach((part, i) => {
+      const eg = _parseOneEgress(part, "socks-" + (_journeyEgresses.length + 1), used);
+      if (eg) _journeyEgresses.push(eg);
+    });
+  }
+  // 每个出口初始化健康状态
+  _journeyEgresses.forEach((eg) => {
+    eg.connectTimeoutMs = JOURNEY_PROXY_CONNECT_TIMEOUT_MS;
+    eg.health = {
+      state: "unknown", fails: 0, openUntil: 0, lastCode: null,
+      lastOkTs: 0, lastErrTs: 0, lastProbeTs: 0, probeFails: 0, probeOk: null,
+      servedOk: 0, servedFail: 0,
+    };
+  });
+  if (_journeyEgresses.length) {
+    // 兼容旧读取点
+    JOURNEY_SOCKS5_HOST = _journeyEgresses[0].host;
+    JOURNEY_SOCKS5_PORT = _journeyEgresses[0].port;
+    console.log("[socks5] 行程抓取出口池: " + _journeyEgresses.length + " 个 → " +
+      _journeyEgresses.map((e) => e.id + "(" + e.host + ":" + e.port + ")").join(", "));
+  } else if (ZUGFINDER_SOCKS5_MAIN || ZUGFINDER_SOCKS5_EXTRA) {
+    console.error("[socks5] 所有出口均无效，行程抓取将回退到 relay/direct");
+  }
+})();
 
 // ── 行程抓取通道降级（2026-09-19）──────────────────────────────
 // 背景：SOCKS5 通道依赖 tailscale exit node（一台手机）。当手机掉线 / 未转发
@@ -1440,39 +1508,129 @@ function channelError(code, msg) {
   return e;
 }
 
-// SOCKS5 是**本机 127.0.0.1 端口**，正常握手是毫秒级；15s 纯属浪费（用户干等）。
-// 默认 4s，可用环境变量覆盖。
-const JOURNEY_PROXY_CONNECT_TIMEOUT_MS =
-  parseInt(process.env.JOURNEY_PROXY_CONNECT_TIMEOUT_MS || "", 10) || 4000;
-
-// 允许的降级链（默认全开）。运维可设 JOURNEY_CHANNEL_FALLBACK=socks 禁止降级。
-const JOURNEY_CHANNEL_FALLBACK = (process.env.JOURNEY_CHANNEL_FALLBACK || "socks,relay,direct")
+// 允许的降级链。默认 "socks,relay"（**不含 direct**）：
+// direct 走部署机的腾讯云 CN IP，必被 bahnapp WAF 拦，只会白白多等几秒
+// 并给出误导性的「来源被拒」。运维可显式加回 direct（如本地联调）。
+const JOURNEY_CHANNEL_FALLBACK = (process.env.JOURNEY_CHANNEL_FALLBACK || "socks,relay")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
-// ── 代理健康度熔断（进程内，不持久化）─────────────────────────
-// 连续 N 次通道失败 → 冷却期内直接跳过 SOCKS（不再每次等超时）。
+// ── 出口健康度熔断（逐出口，进程内，不持久化）────────────────────
+// 连续 N 次通道失败 → 冷却期内跳过【该出口】（不再每次等超时）。
 // 冷却结束后进入「半开」：下一次请求会再试一次，成功即复位。
-const PROXY_FAIL_THRESHOLD = 3;
-const PROXY_COOLDOWN_MS = 60 * 1000;
-const _proxyHealth = { fails: 0, openUntil: 0, lastCode: null };
-function proxyCircuitOpen() { return Date.now() < _proxyHealth.openUntil; }
-function proxyNoteFailure(code) {
-  _proxyHealth.lastCode = code;
-  if (++_proxyHealth.fails >= PROXY_FAIL_THRESHOLD && !proxyCircuitOpen()) {
-    _proxyHealth.openUntil = Date.now() + PROXY_COOLDOWN_MS;
-    console.warn("[journey-channel] socks 熔断开启 " + PROXY_COOLDOWN_MS + "ms (last=" + code + ")");
+// 关键：状态挂在**每个出口**上，而非全局 —— 一个出口死掉不影响其他出口。
+const PROXY_FAIL_THRESHOLD =
+  Math.max(1, parseInt(process.env.JOURNEY_PROXY_FAIL_THRESHOLD || "", 10) || 3);
+const PROXY_COOLDOWN_MS =
+  Math.max(0, parseInt(process.env.JOURNEY_PROXY_COOLDOWN_MS || "", 10) || 60000);
+function egressCircuitOpen(eg) { return !!eg && Date.now() < eg.health.openUntil; }
+function egressNoteFailure(eg, code) {
+  if (!eg) return;
+  eg.health.lastCode = code;
+  eg.health.lastErrTs = Date.now();
+  eg.health.servedFail++;
+  if (++eg.health.fails >= PROXY_FAIL_THRESHOLD && !egressCircuitOpen(eg)) {
+    eg.health.openUntil = Date.now() + PROXY_COOLDOWN_MS;
+    eg.health.state = "circuit_open";
+    console.warn("[journey-channel] 出口 " + eg.id + " 熔断开启 " + PROXY_COOLDOWN_MS + "ms (last=" + code + ")");
+  } else {
+    eg.health.state = "unhealthy";
   }
 }
-function proxyNoteSuccess() { _proxyHealth.fails = 0; _proxyHealth.openUntil = 0; }
+function egressNoteSuccess(eg) {
+  if (!eg) return;
+  eg.health.fails = 0;
+  eg.health.openUntil = 0;
+  eg.health.lastCode = null;
+  eg.health.lastOkTs = Date.now();
+  eg.health.probeFails = 0;
+  eg.health.probeOk = true;
+  eg.health.servedOk++;
+  eg.health.state = "healthy";
+}
+
+// ── 主动出口探测（2026-09-21）─────────────────────────────────
+// 目的：在用户请求到来【之前】就知道哪个出口活着，使故障转移瞬时发生，
+//      而不是让用户先等一次 4s 超时再降级。
+// 目标：探测真实业务路径（bahnapp route 页）——它才反映「这个出口现在能不能
+//      拿到页面」，且被 WAF 拦时会 302 到 denied 页（可据此判定出口在黑名单）。
+// 对目标站友好：间隔 ≥90s、熔断中的出口跳过、healthy 的降频、复用业务同一 UA。
+const JOURNEY_PROBE_INTERVAL_MS =
+  Math.max(0, parseInt(process.env.JOURNEY_PROBE_INTERVAL_MS || "", 10) || 90000);
+const JOURNEY_PROBE_FAIL_THRESHOLD =
+  Math.max(1, parseInt(process.env.JOURNEY_PROBE_FAIL_THRESHOLD || "", 10) || 2);
+const JOURNEY_PROBE_URL = (process.env.JOURNEY_PROBE_URL || "https://bahnapp.online/route").trim();
+let _journeyProbeRound = 0;
+let _journeyProbeRunning = false;
+
+// 探测单个出口：复用真实业务抓取路径（零新协议代码）。
+// 只做「软标记」：失败置 unhealthy，但**不触发熔断**（熔断仍由真实业务失败驱动），
+// 避免探测误判把一个其实能用的出口干掉。
+function probeEgress(eg, cb) {
+  fetchJourneyViaSocks(eg, JOURNEY_PROBE_URL, (err) => {
+    eg.health.lastProbeTs = Date.now();
+    if (!err) {
+      eg.health.probeFails = 0;
+      eg.health.probeOk = true;
+      if (eg.health.state !== "circuit_open") eg.health.state = "healthy";
+      return cb(null);
+    }
+    eg.health.probeOk = false;
+    if (err.message === "journey_source_blocked") {
+      // 出口在 WAF 黑名单里（业务也会被拦）→ 标记不健康，但这是语义结果不是通道故障
+      eg.health.lastCode = "probe_denied";
+      eg.health.state = "unhealthy";
+      return cb(err);
+    }
+    if (err.proxyUnavailable) {
+      eg.health.lastCode = err.code || eg.health.lastCode;
+      if (++eg.health.probeFails >= JOURNEY_PROBE_FAIL_THRESHOLD) {
+        if (eg.health.state !== "circuit_open") eg.health.state = "unhealthy";
+      }
+      return cb(err);
+    }
+    cb(err);
+  });
+}
+
+// 串行探测所有出口（串行 = 不在瞬时打出多条连接，避免异常特征）。
+function _journeyProbeOnce() {
+  if (_journeyProbeRunning) return;
+  _journeyProbeRunning = true;
+  _journeyProbeRound++;
+  const targets = _journeyEgresses.filter((eg) => {
+    if (egressCircuitOpen(eg)) return false;              // 熔断中：跳过（免得反复捅 WAF）
+    // healthy 的降频：每 3 轮探一次，其余轮次跳过
+    if (eg.health.state === "healthy" && (_journeyProbeRound % 3) !== 1) return false;
+    return true;
+  });
+  let i = 0;
+  const next = () => {
+    if (i >= targets.length) { _journeyProbeRunning = false; return; }
+    const eg = targets[i++];
+    probeEgress(eg, () => next());
+  };
+  next();
+}
+
+function startJourneyProbeLoop() {
+  if (!_journeyEgresses.length || JOURNEY_PROBE_INTERVAL_MS <= 0) return;
+  // 首轮延迟 15s，避开启动/预热争抢；unref 不阻塞进程退出。
+  setTimeout(() => {
+    _journeyProbeOnce();
+    setInterval(_journeyProbeOnce, JOURNEY_PROBE_INTERVAL_MS).unref();
+  }, 15000).unref();
+  console.log("[journey-probe] 出口探测已启动：每 " + JOURNEY_PROBE_INTERVAL_MS + "ms 探测 " + JOURNEY_PROBE_URL);
+}
 
 // 通过 SOCKS5 建立到 host:port 的 TCP 连接，然后交给 https.request 复用。
 // 手写 SOCKS5 握手（无认证 + 域名寻址），避免引入第三方依赖。
-function socks5Connect(host, port, cb) {
+// egress：出口对象（决定连哪个代理端口 + 各自超时）。
+function socks5Connect(egress, host, port, cb) {
   const net = require("net");
-  const sock = net.connect(JOURNEY_SOCKS5_PORT, JOURNEY_SOCKS5_HOST);
+  const sock = net.connect(egress.port, egress.host);
   let stage = 0;
   const fail = (msg) => { try { sock.destroy(); } catch (_) {} cb(msg instanceof Error ? msg : new Error(msg)); };
-  sock.setTimeout(JOURNEY_PROXY_CONNECT_TIMEOUT_MS,
+  sock.setTimeout(egress.connectTimeoutMs || JOURNEY_PROXY_CONNECT_TIMEOUT_MS,
     () => fail(channelError(JOURNEY_CHANNEL_ERR.SOCKS_CONNECT_TIMEOUT, "SOCKS5 连接超时")));
   sock.on("error", (e) => {
     const code = /ENOTFOUND|EAI_AGAIN/.test(e.code || "")
@@ -1515,7 +1673,8 @@ function socks5Connect(host, port, cb) {
 }
 
 // 通过 SOCKS5 抓取页面（支持重定向，逻辑与直连路径一致）。
-function fetchJourneyViaSocks(target, cb, redirects) {
+// egress：走哪个出口（首个参数）。
+function fetchJourneyViaSocks(egress, target, cb, redirects) {
   let parsed;
   try { parsed = new URL(target); } catch (_) { return cb(new Error("无效的行程链接")); }
   // 白名单与 fetchJourneyPage 保持一致（含 int.bahn.de）——否则降级到本通道时
@@ -1525,7 +1684,7 @@ function fetchJourneyViaSocks(target, cb, redirects) {
   }
   const https = require("https");
   const tls = require("tls");
-  socks5Connect(parsed.hostname, parsed.port || 443, (err, sock) => {
+  socks5Connect(egress, parsed.hostname, parsed.port || 443, (err, sock) => {
     if (err) return cb(err);
     // SOCKS5 只打通了 TCP；这里必须显式做 TLS 握手，
     // 直接把明文 socket 交给 https.request 会 socket hang up。
@@ -1583,7 +1742,7 @@ function fetchJourneyViaSocks(target, cb, redirects) {
       }
       if (code >= 300 && code < 400 && hdrs.location && (redirects || 0) < 4) {
         const next = new URL(hdrs.location, parsed).toString();
-        return fetchJourneyViaSocks(next, cb, (redirects || 0) + 1);
+        return fetchJourneyViaSocks(egress, next, cb, (redirects || 0) + 1);
       }
       if (code < 200 || code >= 400) return finish(new Error("行程链接返回 HTTP " + code));
       // chunked 传送解码（按字节切片）
@@ -1700,55 +1859,111 @@ function fetchJourneyViaDirect(target, cb, redirects) {
   req.on("error", (e) => cb(channelError(JOURNEY_CHANNEL_ERR.TLS, "行程抓取失败: " + e.message)));
 }
 
-// 按配置计算本次可用的通道顺序（受 JOURNEY_CHANNEL_FALLBACK 收窄 + 熔断影响）。
+// ── 通道事件可观测性（进程内环形缓冲 + 累计计数）─────────────────
+// 记录每次行程抓取的通道选择结果，供 /api/debug 与排查使用。
+const _journeyChannelLog = [];   // 环形，上限 50
+const _journeyChannelStats = {
+  total: 0, ok: 0, degraded: 0, semantic_fail: 0, all_failed: 0,
+  by_channel: {}, by_egress: {},
+};
+function _jcBump(bucket, key, field) {
+  if (!bucket[key]) bucket[key] = { ok: 0, fail: 0 };
+  bucket[key][field]++;
+}
+function recordJourneyChannelEvent(entry) {
+  const e = Object.assign({ ts: new Date().toISOString() }, entry || {});
+  _journeyChannelLog.push(e);
+  if (_journeyChannelLog.length > 50) _journeyChannelLog.shift();
+  _journeyChannelStats.total++;
+  if (e.outcome === "ok") _journeyChannelStats.ok++;
+  else if (e.outcome === "degrade") _journeyChannelStats.degraded++;
+  else if (e.outcome === "semantic_fail") _journeyChannelStats.semantic_fail++;
+  else if (e.outcome === "all_failed") _journeyChannelStats.all_failed++;
+  if (e.channel) _jcBump(_journeyChannelStats.by_channel, e.channel, e.outcome === "ok" ? "ok" : "fail");
+  if (e.egress) _jcBump(_journeyChannelStats.by_egress, e.egress, e.outcome === "ok" ? "ok" : "fail");
+}
+
+// 按配置计算本次可用的通道顺序（受 JOURNEY_CHANNEL_FALLBACK 收窄 + 逐出口熔断影响）。
+// 返回**对象数组**：[{channel:"socks", egress:<Egress>}, {channel:"relay"}, ...]
+// 逐出口熔断：一个出口熔断不影响同通道的其他出口入队。
 function journeyChannelPlan() {
   const allow = JOURNEY_CHANNEL_FALLBACK;
   const plan = [];
-  if (JOURNEY_SOCKS5_HOST && allow.includes("socks")) {
-    if (proxyCircuitOpen()) {
-      console.warn("[journey-channel] 跳过 socks（熔断中，last=" + _proxyHealth.lastCode + "）");
-    } else {
-      plan.push("socks");
+  if (allow.includes("socks")) {
+    for (const eg of _journeyEgresses) {
+      if (egressCircuitOpen(eg)) {
+        console.warn("[journey-channel] 跳过出口 " + eg.id + "（熔断中，last=" + eg.health.lastCode + "）");
+      } else {
+        plan.push({ channel: "socks", egress: eg });
+      }
     }
   }
-  if (JOURNEY_RELAY_ON && allow.includes("relay")) plan.push("relay");
-  if (allow.includes("direct")) plan.push("direct");
+  if (JOURNEY_RELAY_ON && allow.includes("relay")) plan.push({ channel: "relay" });
+  if (allow.includes("direct")) plan.push({ channel: "direct" });
   return plan;
 }
 
-// 按通道顺序尝试；**仅当 err.proxyUnavailable** 时降级到下一个通道。
+// plan 项 → 人类可读标签（用于日志/降级链），如 "socks:de-phone" 或 "relay"
+function _planLabel(item) {
+  return item.egress ? (item.channel + ":" + item.egress.id) : item.channel;
+}
+
+// 按通道顺序尝试；**仅当 err.proxyUnavailable** 时降级到下一个通道/出口。
 // 成功或语义失败（WAF 拒绝 / 链接失效 / 解析失败等）立即返回，不降级。
 function fetchJourneyByChannel(target, plan, idx, redirects, degraded, cb) {
   if (idx >= plan.length) {
+    recordJourneyChannelEvent({ outcome: "all_failed", detail: "all channels unavailable", tried: degraded });
     // 所有通道都不可用：返回最后一个通道错误（带码，供上层映射稳定错误码）
-    return cb(degraded.length
-      ? channelError(JOURNEY_CHANNEL_ERR.SOCKS_REJECTED, "所有行程抓取通道均不可用")
-      : new Error("行程抓取失败"));
+    const e = degraded.length
+      ? channelError(JOURNEY_CHANNEL_ERR.SOCKS_REJECTED, "所有行程抓取通道均不可用（已尝试 " + degraded.length + " 个出口/通道）")
+      : new Error("行程抓取失败");
+    e.tried = degraded.slice();
+    return cb(e);
   }
-  const channel = plan[idx];
+  const item = plan[idx];
+  const channel = item.channel;
   const onResult = (err, html) => {
     if (err) {
       if (err.proxyUnavailable) {
-        if (channel === "socks") proxyNoteFailure(err.code);
+        if (item.egress) egressNoteFailure(item.egress, err.code);
         const next = plan[idx + 1];
         console.warn("[journey-channel] " + JSON.stringify({
-          event: "degrade", from: channel, to: next || null,
+          event: "degrade", from: _planLabel(item), to: next ? _planLabel(next) : null,
           reason: err.code, detail: String(err.message || ""),
           ts: new Date().toISOString(),
         }));
-        return fetchJourneyByChannel(target, plan, idx + 1, redirects, degraded.concat(channel), cb);
+        recordJourneyChannelEvent({
+          outcome: "degrade", channel: channel,
+          egress: item.egress ? item.egress.id : null,
+          code: err.code, from: _planLabel(item), to: next ? _planLabel(next) : null,
+        });
+        return fetchJourneyByChannel(target, plan, idx + 1, redirects, degraded.concat(_planLabel(item)), cb);
       }
-      return cb(err); // 语义失败：不降级
+      // 语义失败：通道是通的，换出口也一样 → 不降级
+      recordJourneyChannelEvent({
+        outcome: "semantic_fail", channel: channel,
+        egress: item.egress ? item.egress.id : null,
+        code: err.message === "journey_source_blocked" ? "waf_blocked" : null,
+        detail: String(err.message || ""),
+      });
+      return cb(err);
     }
-    if (channel === "socks") proxyNoteSuccess();
+    if (item.egress) egressNoteSuccess(item.egress);
+    // degraded_from 保持「纯 channel 名」数组（前端契约不变）；出口细节另放 degraded_egress
+    const channelNames = degraded.map((l) => String(l).split(":")[0]);
+    const egressNames = degraded.filter((l) => String(l).includes(":")).map((l) => String(l));
+    recordJourneyChannelEvent({
+      outcome: "ok", channel: channel, egress: item.egress ? item.egress.id : null,
+      degraded_from: degraded.slice(),
+    });
     if (degraded.length) {
       console.log("[journey-channel] " + JSON.stringify({
-        event: "success", channel: channel, degraded_from: degraded,
+        event: "success", channel: _planLabel(item), degraded_from: degraded,
       }));
     }
-    cb(null, html, { channel: channel, degraded_from: degraded });
+    cb(null, html, { channel: channel, degraded_from: channelNames, degraded_egress: egressNames });
   };
-  if (channel === "socks") return fetchJourneyViaSocks(target, onResult, redirects);
+  if (channel === "socks") return fetchJourneyViaSocks(item.egress, target, onResult, redirects);
   if (channel === "relay") return fetchJourneyViaRelay(target, onResult, redirects);
   return fetchJourneyViaDirect(target, onResult, redirects);
 }
@@ -2858,11 +3073,31 @@ function handleRequest(req, res, parsed, pathname) {
     out.checks.timetable = { ok: !!timetable, detail: timetable ? (timetable.length + " 班次") : "未加载" };
     // 3) 预测 worker（决定 /api/train 冷查询是 12s 还是 60s+）
     out.checks.predictor_worker = { ok: null, detail: "未探测（见 /api/health?deep=1）" };
-    // 4) 行程抓取代理
-    out.checks.journey_proxy = {
-      ok: !!JOURNEY_SOCKS5_HOST,
-      detail: JOURNEY_SOCKS5_HOST ? (JOURNEY_SOCKS5_HOST + ":" + JOURNEY_SOCKS5_PORT) : "未配置（直连，bahnapp WAF 可能拦截）",
-    };
+    // 4) 行程抓取出口池（真检查：池中是否有可用出口，而非仅静态回显配置）
+    //    ok=null 表示「未配置代理」（对齐 predictor_worker 约定）；
+    //    有出口但全不健康 → ok:false 且整体 degraded（此时 relay 不可用才致命）。
+    if (!_journeyEgresses.length) {
+      out.checks.journey_proxy = {
+        ok: null,
+        detail: JOURNEY_RELAY_ON ? "未配置 SOCKS5 出口（走 relay）" : "未配置（直连，bahnapp WAF 可能拦截）",
+        egresses: [],
+      };
+    } else {
+      const healthy = _journeyEgresses.filter((eg) => eg.health.state === "healthy");
+      const usable = _journeyEgresses.filter((eg) => !egressCircuitOpen(eg));
+      out.checks.journey_proxy = {
+        ok: usable.length > 0,
+        detail: healthy.length + "/" + _journeyEgresses.length + " 出口健康" +
+          "（" + _journeyEgresses.map((eg) => eg.id + "=" + eg.health.state).join(", ") + "）",
+        egresses: _journeyEgresses.map((eg) => ({
+          id: eg.id, addr: eg.host + ":" + eg.port,
+          state: eg.health.state, circuit_open: egressCircuitOpen(eg),
+          last_code: eg.health.lastCode,
+        })),
+      };
+      // 仅当**全部出口都不可用**（熔断/不健康）**且** relay 也未启用时才判降级
+      if (usable.length === 0 && !JOURNEY_RELAY_ON) out.status = "degraded";
+    }
     // 5) 评论配图 EXIF 剥离能力（QA SEC-05 / LOW-07）
     // 依赖 tools/strip_exif.py（PIL）。缺失时上传仍可用，但会静默跳过 GPS 剥离 ——
     // 「隐私保护失效」这种事必须让运维看得见，所以单独列一项。
@@ -3301,9 +3536,15 @@ function handleRequest(req, res, parsed, pathname) {
         if (err.message === "journey_source_blocked") {
           return sendJSON(res, 422, { error: "journey_source_blocked" });
         }
-        // 通道层失败（代理/中转/直连全不可用）→ 稳定码，前端本地化。
+        // 通道层失败（所有出口/中转/直连全不可用）→ 稳定码，前端本地化。
+        // 额外附 channel_code / tried，便于运维区分「全出口连不上」还是「DNS 挂了」。
         if (err.proxyUnavailable) {
-          return apiFail(res, 502, "E_JOURNEY_PROXY", err.message);
+          return sendJSON(res, 502, {
+            error: "E_JOURNEY_PROXY",
+            message: err.message,
+            channel_code: err.code || null,
+            tried: Array.isArray(err.tried) ? err.tried : [],
+          });
         }
         if (err.message === "行程链接请求超时") {
           return apiFail(res, 502, "E_JOURNEY_TIMEOUT", err.message);
@@ -4575,6 +4816,7 @@ server.listen(PORT, () => {
   console.log(`列车晚点 webapp 已启动: http://localhost:${PORT}`);
   console.log(`示例: http://localhost:${PORT}/?train=ICE%20578`);
   cleanTrainDiskCache(); // 启动即清一次非当日预测缓存（次日自动失效的另一半）
+  startJourneyProbeLoop(); // 行程出口池主动探测：提前发现出口掉线，故障转移瞬时化
 });
 
 // ── /api/debug：实时任务视图（2026-09-20）────────────────────────────────
@@ -4615,6 +4857,31 @@ function handleDebug(req, res, parsed) {
         return { id: e.id, train: e.train, from: e.rideFrom, to: e.rideTo, date: e.date,
                  stage: e.stage, ok: e.ok, latency_ms: e.latencyMs, age_s: Math.round((now - e.endedAt) / 1000) };
       }),
+      // 行程抓取出口池：谁在池里、各自健康、最近用了哪条通道。
+      // 排查「手机离线 → 行程抓取挂」时的第一手现场。
+      journeyChannels: {
+        fallback_order: JOURNEY_CHANNEL_FALLBACK,
+        pool_on: JOURNEY_SOCKS_POOL_ON,
+        relay_on: JOURNEY_RELAY_ON,
+        probe_interval_ms: (typeof JOURNEY_PROBE_INTERVAL_MS === "number" ? JOURNEY_PROBE_INTERVAL_MS : null),
+        egresses: _journeyEgresses.map(function (eg) {
+          return {
+            id: eg.id,
+            addr: eg.host + ":" + eg.port,
+            state: eg.health.state,
+            circuit_open: egressCircuitOpen(eg),
+            open_for_ms: Math.max(0, eg.health.openUntil - now),
+            fails: eg.health.fails,
+            last_code: eg.health.lastCode,
+            last_ok_age_s: eg.health.lastOkTs ? Math.round((now - eg.health.lastOkTs) / 1000) : null,
+            last_probe_age_s: eg.health.lastProbeTs ? Math.round((now - eg.health.lastProbeTs) / 1000) : null,
+            probe_ok: eg.health.probeOk,
+            served: { ok: eg.health.servedOk, fail: eg.health.servedFail },
+          };
+        }),
+        stats: _journeyChannelStats,
+        recent: _journeyChannelLog.slice(-20),
+      },
       worker: worker,
     };
     sendJSON(res, 200, out);
