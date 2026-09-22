@@ -3802,6 +3802,37 @@ function syncStationClears() {
 setupStationClear(fromInput);
 setupStationClear(toInput);
 
+// ── 行程输入框一键清空（× 按钮）──
+// 与站对站同款交互：有值显示 ×，点击清空、聚焦、并把状态条复位。
+// 行程表单用 <input> + <textarea>，两者都按 input 事件同步 has-value。
+(function setupJourneyClears() {
+  ["journeyUrlInput", "journeyTextInput"].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const field = el.closest(".journey-field");
+    if (!field) return;
+    const clearBtn = field.querySelector(".station-clear");
+    if (!clearBtn) return;
+    const sync = function () { field.classList.toggle("has-value", !!el.value); };
+    el.addEventListener("input", sync);
+    el.addEventListener("change", sync);
+    el._syncJourneyClear = sync;
+    sync();
+    clearBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      el.value = "";
+      sync();
+      el.focus();
+      // 清空后把状态/结果条复位，避免残留上一次的「已分析/报错」提示
+      const st = document.getElementById("journeyStatus");
+      if (st) { st.classList.add("hidden"); st.textContent = ""; }
+      const res = document.getElementById("journeyResult");
+      if (res) { res.classList.add("hidden"); res.innerHTML = ""; }
+    });
+  });
+})();
+
 // 拼出最终查询的车次字符串：用户选了车型 + 输入号 → "RE 11"；只输入 → 原样
 function buildTrainQuery() {
   const num = trainInput.value.trim();

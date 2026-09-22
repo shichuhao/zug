@@ -890,6 +890,39 @@ def _fmt_hhmm(v) -> str:
         return s[11:16]
     return s if s else "—"
 
+def _parse_dt(v) -> "datetime | None":
+    """ISO 字符串/ datetime → 带时区的 datetime（若有 Z/offset 则保留 tzinfo）。
+
+    用于「按完整时刻（含日期）判定列车是否已收车」——只取 HH:MM 会在跨天时误判。
+    解析失败返回 None（调用方据此跳过判定，不做激进假设）。
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    s = str(v).strip()
+    if not s or s == "—":
+        return None
+    try:
+        # 处理结尾 Z（fromisoformat 在 3.11 支持，但兜底替换以兼容更早版本）
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        try:
+            return datetime.fromisoformat(s.replace("T", " ").split("+")[0].split(".")[0])
+        except Exception:  # noqa: BLE001
+            return None
+
+def _age_seconds(dt) -> "float | None":
+    """dt 距今多少秒（正数=已过去，负数=尚未发生）。
+
+    关键点：tz-aware 与 naive 不能相减（会抛 TypeError）。这里把 now 取到与 dt
+    **相同**的时区再比，两类输入都能安全处理（2026-09-23 踩坑记录）。
+    """
+    if dt is None:
+        return None
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    return (now - dt).total_seconds()
+
 def collect_with_fallback(client, train, days, gap):
     """collect 限流时自动从 PieBro 历史降级"""
     recs = collect(client, train, days, gap)
@@ -1524,9 +1557,14 @@ def db_realtime_train(train: str, date_iso: str = "",
         rows = []
         realtime_seen = False
         terminal_realtime = False  # 终点站是否已有实时数据（列车已终到/正在终点）
+        # 终点站计划到达的**原始带日期值**（跨天判定必需）——见下方 journey_finished。
+        _dest_raw = None
         # 运行中补正：跟踪"最后一个有实时延误的站" = 列车当前位置 + 当前延误
         last_rt_delay: int | None = None
         last_rt_station = ""
+        # 收车判定辅助：最近一次实时事件时刻 / 是否存在"未来的实时事件"
+        _last_rt_dt = None
+        _any_future_rt = False
         # 站名 → (adelay, ddelay)，供兜底（currentStop/lastKnownPosition）命中时取延误
         stop_delay_map: dict[str, tuple[int | None, int | None]] = {}
         for i, s in enumerate(stops):
@@ -1542,6 +1580,24 @@ def db_realtime_train(train: str, date_iso: str = "",
                 int(adelay) if adelay is not None else None,
                 int(ddelay) if ddelay is not None else None,
             )
+            # 记录"最近一次实时事件"→ 判定列车是否仍在推进（见 journey_finished）
+            for _ev in (arr, dep):
+                if not (_ev.get("isRealTime") and (_ev.get("time") or _ev.get("scheduledTime"))):
+                    continue
+                _ev_dt = _parse_dt(_ev.get("time"))
+                _ev_age = _age_seconds(_ev_dt)
+                if _ev_age is None:
+                    continue
+                if _ev_age < 0:
+                    _any_future_rt = True   # 仍有"未来"的实时事件 → 列车还在跑
+                elif _last_rt_dt is None or (_age_seconds(_last_rt_dt) or 0) > _ev_age:
+                    _last_rt_dt = _ev_dt
+            if i == len(stops) - 1:
+                # 终点站计划到达时刻（优先 arrival，回退 departure）。必须保留**原始带日期值**：
+                # 只取 HH:MM 会丢日期，跨天时误判（昨晚 12:20 到站的车，今天看 HH:MM 会当成
+                # "今天 12:20 尚未到"）——见下方 journey_finished。
+                _dest_raw = (arr.get("time") or arr.get("scheduledTime")
+                             or dep.get("time") or dep.get("scheduledTime"))
             if arr.get("isRealTime") or dep.get("isRealTime"):
                 v = None
                 if adelay is not None:
@@ -1597,14 +1653,40 @@ def db_realtime_train(train: str, date_iso: str = "",
         # 位置/延误：优先"最后一个 isRealTime 站"（真实当前位置），
         # 回退 currentStop/lastKnownPosition（仅当全程尚无实时站，取计划延误占位）。
         # 已终到时不设 current_*（列车不在"运行中"状态）。
+        #
+        # 终止判定（2026-09-21 修复「已开完还显示 当前 N 分」）：
+        #   terminal_realtime 只反映"终点站是否带 isRealTime 标记"，而列车终到后
+        #   上游常**不再刷新终点站**的实时标记 → 该值为 False，导致仍输出 current_delay，
+        #   前端就一直显示"当前 N 分"。
+        #   实测样例（ICE 847）：末站 Berlin Südkreuz 的到达是**前一天** 12:20 且无实时，
+        #   而前一个站 Berlin Hbf 仍是 isRealTime=True/delay=47，于是 last_rt 命中它，
+        #   次日凌晨查询仍输出「当前 47 分」。仅比 HH:MM 会因跨天误判（"12:20 尚未到"）。
+        #   故用**原始带日期时刻** + 20 分钟宽限做硬判定：终点计划到达（含日期）已过 → 已收车。
+        journey_finished = terminal_realtime
+        if not journey_finished:
+            try:
+                # 注意：不能用 datetime.utcnow()——它返回**朴素** datetime，与带 tzinfo 的
+                # _dest_dt 相减会抛 TypeError 并被 except 吞掉，判定静默失效
+                # （2026-09-23 踩坑：ICE 847 一直显示"当前 47 分"）。_age_seconds 已处理时区。
+                _grace = 20 * 60
+                _dest_age = _age_seconds(_parse_dt(_dest_raw))
+                # 双条件：① 终点计划到达（含日期）已过 20 分钟以上
+                #        ② 近期不再有实时推进（最近一次实时事件也超过 20 分钟前，且无未来事件）
+                #   只靠①会把"终点晚点但仍在跑"误判为收车；只靠②会把"中途长停"误判为收车。
+                if _dest_age is not None and _dest_age >= _grace and not _any_future_rt:
+                    _last_age = _age_seconds(_last_rt_dt)
+                    if _last_age is None or _last_age >= _grace:
+                        journey_finished = True
+            except Exception:  # noqa: BLE001
+                pass
         cur_delay: int | None = None
         cur_station = ""
         position_source = ""
-        if not terminal_realtime and last_rt_delay is not None:
+        if not journey_finished and last_rt_delay is not None:
             cur_delay = last_rt_delay
             cur_station = last_rt_station
             position_source = "last_realtime_stop"
-        if cur_delay is None and not terminal_realtime and cur_name:
+        if cur_delay is None and not journey_finished and cur_name:
             ad, dd = stop_delay_map.get(cur_name, (None, None))
             v = ad if ad is not None else dd
             if v is not None:

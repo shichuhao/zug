@@ -156,8 +156,14 @@
  </div>
  <button id="journeyPredictBtn" type="button" data-i18n="journey.analyze">分析行程</button>
  </div>
- <input id="journeyUrlInput" class="journey-url-input" type="url" placeholder="https://bahnapp.link/route/..." data-i18n-ph="journey.urlPlaceholder" autocomplete="off" />
- <textarea id="journeyTextInput" class="journey-text-input" rows="3" placeholder="链接无法访问时，也可以粘贴行程文本（例如 RE1 (73718) From 06:12 ... To 07:50 ...）" data-i18n-ph="journey.textPlaceholder"></textarea>
+ <div class="station-field journey-field">
+  <input id="journeyUrlInput" class="journey-url-input" type="url" placeholder="https://bahnapp.link/route/..." data-i18n-ph="journey.urlPlaceholder" autocomplete="off" />
+  <button class="station-clear journey-clear" type="button" title="清空行程链接" aria-label="清空行程链接" data-i18n-title="journey.clearUrl" data-i18n-aria="journey.clearUrl">×</button>
+ </div>
+ <div class="station-field journey-field">
+  <textarea id="journeyTextInput" class="journey-text-input" rows="3" placeholder="链接无法访问时，也可以粘贴行程文本（例如 RE1 (73718) From 06:12 ... To 07:50 ...）" data-i18n-ph="journey.textPlaceholder"></textarea>
+  <button class="station-clear journey-clear journey-text-clear" type="button" title="清空行程文本" aria-label="清空行程文本" data-i18n-title="journey.clearText" data-i18n-aria="journey.clearText">×</button>
+ </div>
  <div id="journeyStatus" class="status hidden" role="status" aria-live="polite"></div>
  <div id="journeyResult" class="journey-result hidden"></div>
  </section>
