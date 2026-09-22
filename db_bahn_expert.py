@@ -37,16 +37,20 @@ journey_details），调用方（train_incidents.py 等）无需改动。
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
+import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timezone
 
 _BE_BASE = "https://bahn.expert/api/orpc"
+_BE_HOST = "bahn.expert"
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -57,17 +61,45 @@ _CTX.verify_mode = ssl.CERT_NONE
 # --------------------------------------------------------------------------- #
 # 网络参数                                                                     #
 # --------------------------------------------------------------------------- #
-# bahn.expert 为免费公开服务，对频率敏感。默认：
-#   - 最少请求间隔 3.5s（首次连击通常没问题，连续触发才限流）
-#   - 瞬时错误（206 空 body / 500 / 超时）退避重试
-#   - 请求级冷却 + 磁盘陈旧缓存回退（缓存命中即毫秒返回）
-_REQ_GAP_SEC = float(os.environ.get("BAHN_EXPERT_GAP_SEC", "3.5"))
+# bahn.expert 为免费公开服务，对频率敏感。保留三层保护，但把「预防性减速」调到
+# 实测所需的最低值 —— 见下方 2026-09-23 降速根因分析。
+#
+# ── 为什么原来要用 3.5s 最小间隔（已废弃）────────────────────────────────
+# 注释原本写着「连续快速请求会返回 HTTP 206 且 body 为空，需 ~6s 间隔重试」。
+# 2026-09-23 实测（keep-alive 单连接，零间隔连打 8 次 journey/find）：
+#     8/8 全部 200 OK，无一次空响应 / 206。
+# 而 3.5s 的代价是实打实的：一次 db_realtime_train 要串行走 find_journey +
+# journey_details 两次调用，第二次必然白等 3.5s；实测首次 0.46s、第二次 3.87s。
+# 冷查询端到端 16~34s 里，这一项独占近三分之一。
+#
+# 现在的 0.4s 不是"取消保护"，只是从「预防性限速」退回「避免瞬时连击」，真正
+# 的兜底交给下面两层：
+#   - 瞬时错误（206 空 body / 500 / 超时）→ 指数退避重试
+#   - 连续失败 → 请求级冷却 30s + 陈旧磁盘缓存回退
+# 若将来对端策略变化，用 BAHN_EXPERT_GAP_SEC 环境变量调回去即可，无需改代码。
+_REQ_GAP_SEC = float(os.environ.get("BAHN_EXPERT_GAP_SEC", "0.4"))
 _RPC_RETRIES = int(os.environ.get("BAHN_EXPERT_RETRIES", "3"))
 _RPC_BACKOFF = 0.6
 _RPC_TIMEOUT_SEC = float(os.environ.get("BAHN_EXPERT_TIMEOUT_SEC", "12"))
 _RPC_COOLDOWN_SEC = float(os.environ.get("BAHN_EXPERT_COOLDOWN_SEC", "30"))
 
+# ── keep-alive 常驻连接（2026-09-23 新增）────────────────────────────────
+# 原实现每次 _rpc 都 urllib.request.urlopen() → 每次新建 TCP + TLS 握手。
+# cProfile 实测：单次 TLS do_handshake 稳定 1.2s，5 次握手累计 6.05s，
+# 而**真正的业务往返只要 0.16s** —— 握手比干活还贵一个数量级。
+# 实测收益（同一连接）：首次 0.44s（含握手），后续每次 0.157s。
+#
+# 单连接 + 顺序复用：本模块的调用都来自 train_insight 的单请求路径，天然串行；
+# 多线程场景（collect 并行化后）由 _conn_lock 保证互斥，不会并发写同一连接。
+_CONN_KEEPALIVE_SEC = float(os.environ.get("BAHN_EXPERT_KEEPALIVE_SEC", "60"))
+_conn = None            # http.client.HTTPSConnection | None
+_conn_born = 0.0
+_conn_lock = threading.Lock()
+
 _rpc_failures: dict[str, float] = {}
+_last_call_ts = 0.0
+# collect 并行化后同进程会有多线程读写 _last_call_ts，无锁会节流失效/重复睡眠
+_throttle_lock = threading.Lock()
 _last_call_ts = 0.0
 
 # 磁盘缓存：成功响应落盘；实时失败时用近期缓存回退（同时减少对端压力）。
@@ -121,13 +153,67 @@ def _cache_get(key: str, ttl: float | None = None):
 
 
 def _throttle() -> None:
-    """保证两次真实网络请求之间 >= _REQ_GAP_SEC，规避 206 空响应限流。"""
+    """保证两次真实网络请求之间 >= _REQ_GAP_SEC，规避瞬时连击被判异常。
+
+    线程安全：collect 并行化后同一进程内会有多个请求线程，全局时间戳必须加锁，
+    否则会出现「同时判定无需等待」的连击，或「各自睡眠」的重复等待。
+    """
     global _last_call_ts
+    with _throttle_lock:
+        wait = _REQ_GAP_SEC - (time.time() - _last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_ts = time.time()
+
+
+def _conn_get():
+    """取一条可用的 keep-alive 连接；没有或已过期就新建。调用方须持 _conn_lock。"""
+    global _conn, _conn_born
     now = time.time()
-    wait = _REQ_GAP_SEC - (now - _last_call_ts)
-    if wait > 0:
-        time.sleep(wait)
-    _last_call_ts = time.time()
+    if _conn is not None and (now - _conn_born) > _CONN_KEEPALIVE_SEC:
+        try:
+            _conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _conn = None
+    if _conn is None:
+        _conn = http.client.HTTPSConnection(
+            _BE_HOST, 443, context=_CTX, timeout=_RPC_TIMEOUT_SEC)
+        _conn_born = now
+    return _conn
+
+
+def _conn_drop():
+    """丢弃当前连接（出错/被服务端关闭时），下次请求会重建。"""
+    global _conn
+    if _conn is not None:
+        try:
+            _conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _conn = None
+
+
+def _post_json(path: str, body: bytes, referer_path: str) -> tuple[int, str]:
+    """走 keep-alive 连接发一次 POST，返回 (status, body_text)。
+
+    失败一律抛异常，由 _rpc 的退避重试接管；连接状态由 _conn_drop 复位。
+    """
+    with _conn_lock:
+        conn = _conn_get()
+        headers = _headers(referer_path)
+        headers["Connection"] = "keep-alive"
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8", "ignore")
+            status = resp.status
+        except Exception:
+            # 连接出问题（服务端断连/超时/SSL 错误）→ 丢弃，下次重建。
+            # 不在锁内重试，交给调用方的退避逻辑，避免锁持有时间过长。
+            _conn_drop()
+            raise
+    return status, raw
 
 
 def _headers(referer_path: str = "/") -> dict:
@@ -172,17 +258,17 @@ def _rpc(procedure: str, input_obj, referer_path: str = "/"):
         raise RuntimeError("bahn.expert %s 暂时不可用（冷却中）" % procedure)
 
     url = "%s/%s" % (_BE_BASE, procedure)
+    path = "/api/orpc/%s" % procedure
     body = json.dumps({"json": input_obj}, ensure_ascii=False).encode("utf-8")
     last_err = None
 
     for attempt in range(_RPC_RETRIES):
         try:
             _throttle()
-            req = urllib.request.Request(url, data=body,
-                                         headers=_headers(referer_path), method="POST")
-            with urllib.request.urlopen(req, timeout=_RPC_TIMEOUT_SEC,
-                                        context=_CTX) as r:
-                raw = r.read().decode("utf-8", "ignore")
+            status, raw = _post_json(path, body, referer_path)
+            if status >= 400:
+                raise urllib.error.HTTPError(url, status, "HTTP %d" % status,
+                                             None, None)
             # 206 + 空 body = 限流；视为可重试错误
             if not raw.strip():
                 last_err = RuntimeError("空响应（疑似限流 206）")
@@ -203,8 +289,14 @@ def _rpc(procedure: str, input_obj, referer_path: str = "/"):
             _rpc_failures.pop(procedure, None)
             return data
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
-                ssl.SSLError, ConnectionError, json.JSONDecodeError) as e:
+                ssl.SSLError, ConnectionError, json.JSONDecodeError, OSError,
+                http.client.HTTPException) as e:
             last_err = e
+            # keep-alive 的典型失效：连接在服务端空闲后被回收，客户端却以为
+            # 还能用 → 复用时抛 SSLZeroReturnError / BrokenPipe / ConnectionReset
+            # （均为 OSError/HTTPException 子类）。这类错误与内容无关，重试即可，
+            # 且下次会拿到刚重建的新连接。丢弃坏连接必须在重试之前。
+            _conn_drop()
             if attempt < _RPC_RETRIES - 1:
                 time.sleep(_RPC_BACKOFF * (2 ** attempt))
                 continue

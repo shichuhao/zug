@@ -51,6 +51,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,7 +77,91 @@ _stats = {"served": 0, "failed": 0, "total_ms": 0.0, "lock": threading.Lock()}
 # 单次预测 23~26s（RB 车次抓取较慢）已可接受；把并发让给「多开几个 worker 实例」
 # 或请求合并（server.js 侧已做同 cacheKey 合并）更划算。
 MAX_CONCURRENCY = max(1, int(os.environ.get("PREDICTOR_MAX_CONCURRENCY", "1")))
-_sem = threading.Semaphore(MAX_CONCURRENCY)
+
+# ── 排队参数（2026-09-23，替代"秒拒 503"）────────────────────────────────
+# 原行为：闸门满 → 立刻 503 worker_busy。线上 server.log 里 12 条 busy 全是
+# duration_ms<10ms 的秒拒 —— 用户高峰期直接看到「预测服务繁忙」，但此刻 worker
+# 其实只是在跑上一单（15~30s），等一等就有。
+#
+# 改为 FIFO 短队列：满了就按先来后到等，等不到才 503。两个硬参数：
+#   PREDICTOR_MAX_WAIT_SEC  队列里最长等 45s。
+#     约束：45 + 单次预测(15~30s) < WORKER_TIMEOUT_MS(server.js:205 默认 120s)。
+#     这条必须守住 —— worker 撑到 node 超时会被判「worker 失败」→ 降级 spawn
+#     （fork 3.4GB python，OOM 老路）；而显式 503 走的是不降级分支。
+#   PREDICTOR_MAX_QUEUE     队列上限 6。超过的毫秒级 503，不让客户端干等。
+MAX_WAIT_SEC = max(0.0, float(os.environ.get("PREDICTOR_MAX_WAIT_SEC", "45")))
+MAX_QUEUE = max(0, int(os.environ.get("PREDICTOR_MAX_QUEUE", "6")))
+
+
+class _FairGate:
+    """FIFO 公平闸门。
+
+    为什么不用 Semaphore.acquire(timeout)：Semaphore 唤醒哪个线程由调度器决定，
+    **无公平性保证** —— 队列里等了 40s 的请求可能被刚来的请求插队，队尾永远
+    超时。这里用「取号 + 有序唤醒」保证先到先得，顺带得到准确的 queue_len。
+
+    用法：
+        ok, waited = gate.acquire(timeout)   # 拿号排队
+        if ok:
+            try: ...
+            finally: gate.release()
+    """
+
+    def __init__(self, slots: int):
+        self._slots = max(1, slots)
+        self._active = 0
+        self._next_ticket = 0
+        self._waiters: deque = deque()   # 排队中的 ticket（FIFO）
+        self._cv = threading.Condition()
+
+    def acquire(self, timeout: float):
+        """返回 (是否拿到, 等待秒数)。拿到后必须 release()。"""
+        t0 = time.time()
+        with self._cv:
+            # 快速路径：有空位且无人排队 → 直接进（保持空闲零开销；有人排队
+            # 时即使有空位也要按号序唤醒，否则就是插队）
+            if self._active < self._slots and not self._waiters:
+                self._active += 1
+                return True, 0.0
+            if timeout <= 0:
+                return False, 0.0
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._waiters.append(ticket)
+            try:
+                while True:
+                    remaining = timeout - (time.time() - t0)
+                    if remaining <= 0:
+                        return False, time.time() - t0
+                    if (self._waiters and self._waiters[0] == ticket
+                            and self._active < self._slots):
+                        self._waiters.popleft()
+                        self._active += 1
+                        return True, time.time() - t0
+                    self._cv.wait(timeout=min(remaining, 0.5))
+            finally:
+                # 超时/异常离场：把自己从队列摘掉（还在队里的话）
+                if ticket in self._waiters:
+                    try:
+                        self._waiters.remove(ticket)
+                    except ValueError:
+                        pass
+
+    def release(self):
+        with self._cv:
+            self._active -= 1
+            self._cv.notify_all()
+
+    @property
+    def queue_len(self) -> int:
+        return len(self._waiters)
+
+    @property
+    def in_use(self) -> int:
+        return self._active
+
+
+_gate = _FairGate(MAX_CONCURRENCY)
 
 # 预测前要求的最小可用内存（MB）。见 run_prediction 内注释：worker 稳态 3.5~3.8GB，
 # 8GB cgroup 下余量本就薄，低于此值就拒服务，避免被内核 OOM 清掉整个常驻进程。
@@ -194,6 +279,103 @@ def warmup():
         traceback.print_exc()
 
 
+# ── 热门车次空闲预热（2026-09-23）────────────────────────────────────────
+# 动机：冷查询 16~34s 的主因是 zugfinder 逐日抓取。同一车次被查过一次后，
+# ~/.cache/zugfinder_pro/<train>/<date>.json 就有了，第二次起毫秒命中。
+# 但缓存只对"当天"有效——次日全部过期，每个人都要重新付一次冷启动的钱。
+#
+# 做法：worker 记录真实查询频次（/hot 可观测），空闲超过 WARMUP_IDLE_SEC 且
+# 闸门空闲时，给 Top-N 车次把「昨天及更早」的缺失日期补进缓存。补过的天次日
+# 依旧是热的，用户冷查询只剩"今天"一天要抓 + DB 实时补充。
+#
+# 三条纪律：
+#   1. 绝不破坏「并发=1」：预热线程必须 non-blocking 抢闸门，抢不到就放弃本轮。
+#      （否则用户请求来了要在预热后面排队，捡了芝麻丢了西瓜）
+#   2. 不碰"今天"：今天的行无论如何会被 _today_snapshot_partial →
+#      db_realtime_train 接管，补了也白补；且当日快照写进缓存会被 stale 判定
+#      拒绝（train_insight.collect 的 is_stale 逻辑），反而制造 pending。
+#   3. 遇限流立刻停：预热是锦上添花，绝不和用户抢账号配额。
+_hot_lock = threading.Lock()
+_hot_counter = {}          # norm_train -> 次数（进程生命周期内累积）
+_last_request_ts = 0.0     # 最近一次 /predict 的时间（判断"空闲"用）
+WARMUP_IDLE_SEC = max(60, int(os.environ.get("PREDICTOR_WARMUP_IDLE_SEC", "300")))
+WARMUP_TOP_N = max(1, int(os.environ.get("PREDICTOR_WARMUP_TOP_N", "5")))
+
+
+def _note_request(train: str):
+    """每个 /predict 请求都会调用：更新频次与空闲时刻。"""
+    global _last_request_ts
+    with _hot_lock:
+        _hot_counter[train] = _hot_counter.get(train, 0) + 1
+        _last_request_ts = time.time()
+
+
+def _hot_trains(n: int) -> list:
+    with _hot_lock:
+        pairs = sorted(_hot_counter.items(), key=lambda kv: -kv[1])
+    return [t for t, _ in pairs[:n]]
+
+
+def _idle_warmer():
+    """空闲预热循环：低频检查，仅在 worker 真闲时工作。"""
+    while True:
+        time.sleep(60)
+        try:
+            if time.time() - _last_request_ts < WARMUP_IDLE_SEC:
+                continue                       # 最近有真实流量 → 让路
+            trains = _hot_trains(WARMUP_TOP_N)
+            if not trains:
+                continue
+            # non-blocking 抢闸门：拿不到说明正在服务用户 → 直接放弃本轮
+            ok, _ = _gate.acquire(0)
+            if not ok:
+                continue
+            try:
+                _prewarm_trains(trains)
+            finally:
+                _gate.release()
+        except Exception as e:  # noqa: BLE001 —— 预热绝不影响服务
+            _log("预热异常（忽略）: %s" % str(e)[:120])
+
+
+def _prewarm_trains(trains: list):
+    """给每个热门车次补「昨天及更早」的缺失日期缓存。"""
+    import train_insight as ti
+    from datetime import timedelta
+
+    cred = os.environ.get("ZUGFINDER_CRED", ti.DEFAULT_CRED)
+    try:
+        cli = ti.ZugfinderPro(cred)
+    except Exception as e:  # noqa: BLE001
+        _log("预热登录失败: %s" % str(e)[:80])
+        return
+    today = ti.date.today()
+    filled = 0
+    for train in trains:
+        for i in range(7, 0, -1):              # 7 天前 → 昨天，不含今天
+            ds = (today - timedelta(days=i)).isoformat()
+            p = os.path.join(ti.CACHE_DIR, train, ds + ".json")
+            if os.path.exists(p):
+                continue
+            try:
+                rows = cli.zuginfo(train, ds)
+            except Exception as e:  # noqa: BLE001 —— 限流/网络问题即停，不挣扎
+                _log("预热 %s %s 失败（停止本轮）: %s" % (train, ds, str(e)[:80]))
+                return
+            if not rows:
+                continue
+            if "Zu viele Abfragen" in str(rows[0].get("arr", "")) \
+                    or "limitreaktivieren" in str(rows[0].get("arr", "")):
+                _log("预热 %s 触发 zugfinder 限流（停止本轮）" % train)
+                return
+            ti._atomic_write_json(p, rows)
+            filled += 1
+            time.sleep(1.5)                     # 与 collect 并行路径的线程内间隔一致
+    if filled:
+        _log("空闲预热完成：补 %d 天（%s）"
+             % (filled, ",".join(trains[:3]) + ("…" if len(trains) > 3 else "")))
+
+
 # ── 预测执行 ─────────────────────────────────────────────────────────────
 def run_prediction(params):
     """
@@ -295,11 +477,21 @@ class Handler(BaseHTTPRequestHandler):
                 "ready": ready,
                 "uptime_s": round(time.time() - _started_at, 1),
                 "max_concurrency": MAX_CONCURRENCY,
-                "in_use": MAX_CONCURRENCY - _sem._value,
+                "in_use": _gate.in_use,
+                "queue_len": _gate.queue_len,
+                "max_queue": MAX_QUEUE,
+                "max_wait_sec": MAX_WAIT_SEC,
                 "served": served,
                 "failed": failed,
                 "avg_ms": round(total / served, 1) if served else 0,
             })
+        if self.path.startswith("/hot"):
+            # 热门车次频次（供人工观察预热效果；node 侧也可取去聚合）
+            try:
+                n = int(self.path.split("n=")[-1]) if "n=" in self.path else 20
+            except ValueError:
+                n = 20
+            return self._send(200, {"hot": _hot_trains(min(max(1, n), 100))})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -310,19 +502,47 @@ class Handler(BaseHTTPRequestHandler):
         if not params.get("train"):
             return self._send(400, {"error": "缺少参数 train"})
 
+        # 热门统计：车次按 CACHE_DIR 的归一格式记（预热直接用它拼缓存路径）
+        try:
+            import train_insight as _ti
+            _note_request(_ti._norm_train(str(params["train"])))
+        except Exception:  # noqa: BLE001 —— 统计失败绝不影响主流程
+            pass
+
         t0 = time.time()
-        # 并发闸门：非阻塞尝试，排队满了就快速失败（让 node 侧降级/排队），
-        # 而不是让用户无限期等待后被自己的超时掐掉
-        if not _sem.acquire(blocking=False):
+        # 内存自保护：排队**前**先查，内存真不够时毫秒级拒绝，不让请求白排 45s
+        _reject = memory_guard()
+        if _reject:
+            return self._send(503, _reject)
+
+        # FIFO 公平排队：满了就按先来后到等（最多 MAX_WAIT_SEC），等不到才 503。
+        # 之前是 _sem.acquire(blocking=False) 秒拒 —— 高峰期用户看到的全是
+        # 「繁忙」，其实等几秒就有槽位。
+        #
+        # 队列上限先查：超过 MAX_QUEUE 的立即毫秒级 503。不查的话，第 MAX_QUEUE+1
+        # 个也会白等满 45s 才超时（2026-09-23 压测踩坑：7 并发里超限者同样
+        # 45.02s 才拿到 503，纯粹浪费客户端等待窗口）。
+        if _gate.queue_len >= MAX_QUEUE:
             return self._send(503, {
                 "error": "worker_busy",
-                "hint": "预测 worker 已达并发上限 %d，请稍后重试" % MAX_CONCURRENCY,
+                "hint": "预测排队已满（%d），请稍后重试" % MAX_QUEUE,
                 "max_concurrency": MAX_CONCURRENCY,
+                "queue_len": _gate.queue_len,
+                "waited_s": 0,
+            })
+        ok, waited_s = _gate.acquire(MAX_WAIT_SEC)
+        if not ok:
+            return self._send(503, {
+                "error": "worker_busy",
+                "hint": "预测排队超时（>%ds），请稍后重试" % int(MAX_WAIT_SEC),
+                "max_concurrency": MAX_CONCURRENCY,
+                "queue_len": _gate.queue_len,
+                "waited_s": round(waited_s, 1),
             })
         try:
             data = run_prediction(params)
         finally:
-            _sem.release()
+            _gate.release()
 
         ms = int((time.time() - t0) * 1000)
         with _stats["lock"]:
@@ -347,6 +567,9 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # 默认值 5：排队线程一多，内核会在 accept 前丢 SYN，客户端拿到的是
+    # connection reset 而不是我们精心准备的 503。显式放大。
+    request_queue_size = 128
 
 
 def main():
@@ -360,6 +583,7 @@ def main():
 
     if not args.no_warmup:
         threading.Thread(target=warmup, daemon=True).start()
+        threading.Thread(target=_idle_warmer, daemon=True).start()
 
     srv = Server(("127.0.0.1", args.port), Handler)
     _log("已监听 http://127.0.0.1:%d" % args.port)

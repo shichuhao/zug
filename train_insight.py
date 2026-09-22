@@ -116,14 +116,222 @@ def _max_delay(rows: list[dict]) -> tuple[float | None, str]:
 
 
 def collect(client: ZugfinderPro, train: str, days: int,
-            gap: float = DEFAULT_DELAY) -> list[dict]:
+            gap: float = DEFAULT_DELAY, cred=None) -> list[dict]:
     """拉最近 days 天逐站，返回 [{date, rows, end_delay, max_delay, max_station, error}]。
 
     单次连续请求 ≤ MAX_DAYS_PER_RUN=8（zugfinder 限流阈值）；已拉过的日期优先从
     本地缓存 (~/.cache/zugfinder_pro/<train>/<date>.json) 读取，避免重复请求。
+
+    并行（2026-09-23）：cred 给出且 ZF_FETCH_WORKERS>1 时走分片并行
+    （_collect_parallel），每个线程用 cred 各自登录、独立 Session；仅本地
+    未命中/需重拉的天发请求，输出与串行版逐字段一致。任何异常退回串行。
     """
-    # 归一车次号（确保前缀后有下划线：RE7 → RE_7）
     train = _norm_train(train)
+    if cred is not None and ZF_FETCH_WORKERS > 1:
+        try:
+            return _collect_parallel(client, train, days, cred)
+        except Exception as e:  # noqa: BLE001 —— 并行任何问题都退回串行
+            print("WARNING: collect 并行路径失败（退回串行）: %s"
+                  % str(e)[:120], file=sys.stderr, flush=True)
+    return _collect_serial(client, train, days, gap)
+
+
+def _collect_parallel(client: ZugfinderPro, train: str, days: int,
+                      cred) -> list[dict]:
+    """collect 的分片并行实现。假定 train 已归一；异常由调用方兜底退回串行。
+
+    输出字段与 _collect_serial 完全一致（含 cached/pending_snapshot/error）。
+    early_bail 语义按日期序复刻：跑完后顺序扫描，遇到连续 2 个限流/异常天，
+    其后所有天（无论是否已抓到）一律改标 rate_limited 并丢弃数据——与串行版
+    "剩余天不发请求"的输出一致，代价是最多多发 workers-1 个请求。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    today = date.today()
+    # ---- 阶段 1：本地计划（零网络）-------------------------------------
+    # 与 _collect_serial 的 stale 判定完全一致（见其注释：当日快照次日过期，
+    # 预算内重拉，最新优先）。
+    stale_budget = 4
+    stale_dates = []
+    for i in range(days - 1, 0, -1):        # 不含今天（今天无"历史快照"概念）
+        ds = (today - timedelta(days=i)).isoformat()
+        cache_path = os.path.join(CACHE_DIR, train, ds + ".json")
+        if os.path.exists(cache_path):
+            try:
+                mt = datetime.fromtimestamp(os.path.getmtime(cache_path)).date()
+                if mt.isoformat() == ds:
+                    stale_dates.append(ds)
+            except Exception:  # noqa: BLE001
+                pass
+    stale_dates.sort(reverse=True)
+    stale_allow = set(stale_dates[:stale_budget])
+
+    results: dict[str, dict] = {}
+    todo: list[str] = []                    # 需要网络的天（升序）
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        ds = d.isoformat()
+        cache_path = os.path.join(CACHE_DIR, train, ds + ".json")
+        handled = False
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, encoding="utf-8") as fh:
+                    rows = json.load(fh)
+                if isinstance(rows, list):
+                    try:
+                        mt = datetime.fromtimestamp(os.path.getmtime(cache_path)).date()
+                        is_stale = (mt == d and ds != today.isoformat())
+                    except Exception:  # noqa: BLE001
+                        is_stale = False
+                    if is_stale:
+                        if ds in stale_allow:
+                            todo.append(ds)          # 预算内 → 重拉
+                        else:
+                            # 超预算的历史快照：终点数据未定型 → 输出空行而非伪 0
+                            results[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                           "max_delay": None, "max_station": "",
+                                           "cached": True,
+                                           "canceled": _is_day_canceled(rows),
+                                           "pending_snapshot": True}
+                    else:
+                        results[ds] = {"date": ds, "rows": rows,
+                                       "end_delay": _end_delay(rows),
+                                       "max_delay": _max_delay(rows)[0],
+                                       "max_station": _max_delay(rows)[1],
+                                       "cached": True,
+                                       "canceled": _is_day_canceled(rows)}
+                    handled = True
+            except Exception:  # noqa: BLE001
+                pass                                  # 缓存损坏 → 当 miss
+        if not handled:
+            todo.append(ds)                          # miss → 实测拉取
+
+    # 待抓天太少不值得并行：线程池 + N-1 次登录本身就是开销
+    if len(todo) <= 2:
+        raise RuntimeError("待抓天仅 %d，退回串行" % len(todo))
+
+    # ---- 阶段 2：分片并行抓取 -------------------------------------------
+    # 交错分片：todo[i::W] 让"最新的一天"分散在不同线程，用户最关心的数据
+    # 不会挤在同一个队列里。
+    workers = min(ZF_FETCH_WORKERS, len(todo))
+    shards = [todo[k::workers] for k in range(workers)]
+
+    def _one_shard(shard: list[str]) -> dict[str, dict]:
+        cli = ZugfinderPro(cred)      # 每线程独立登录 → 独立 Session，互不共享
+        local: dict[str, dict] = {}
+        for j, ds in enumerate(shard):
+            cache_path = os.path.join(CACHE_DIR, train, ds + ".json")
+            is_refetch = os.path.exists(cache_path)
+            d = date.fromisoformat(ds)
+            if is_refetch:
+                # stale 重拉：成功且不限流 → 更新缓存并采用；失败 → 沿用旧缓存
+                try:
+                    fresh = cli.zuginfo(train, ds)
+                    _first = fresh[0] if fresh else {}
+                    _arr = str(_first.get("arr", ""))
+                    if fresh and "Zu viele Abfragen" not in _arr \
+                            and "limitreaktivieren" not in _arr:
+                        _atomic_write_json(cache_path, fresh)
+                        local[ds] = {"date": ds, "rows": fresh,
+                                     "end_delay": _end_delay(fresh),
+                                     "max_delay": _max_delay(fresh)[0],
+                                     "max_station": _max_delay(fresh)[1],
+                                     "cached": True,
+                                     "canceled": _is_day_canceled(fresh)}
+                    else:
+                        with open(cache_path, encoding="utf-8") as fh:
+                            rows = json.load(fh)
+                        local[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                     "max_delay": None, "max_station": "",
+                                     "cached": True,
+                                     "canceled": _is_day_canceled(rows),
+                                     "pending_snapshot": True}
+                except Exception:  # noqa: BLE001
+                    try:
+                        with open(cache_path, encoding="utf-8") as fh:
+                            rows = json.load(fh)
+                        local[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                     "max_delay": None, "max_station": "",
+                                     "cached": True,
+                                     "canceled": _is_day_canceled(rows),
+                                     "pending_snapshot": True}
+                    except Exception:  # noqa: BLE001
+                        local[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                     "max_delay": None, "max_station": "",
+                                     "error": "rate_limited"}
+            else:
+                # miss：实测拉取（限流标记/异常处理与串行版一致）
+                try:
+                    rows = cli.zuginfo(train, ds)
+                    if not rows:
+                        local[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                     "max_delay": None, "max_station": ""}
+                    else:
+                        first = rows[0] if rows else {}
+                        arr = str(first.get("arr", ""))
+                        if "Zu viele Abfragen" in arr or "limitreaktivieren" in arr:
+                            local[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                         "max_delay": None, "max_station": "",
+                                         "error": "rate_limited"}
+                        else:
+                            _atomic_write_json(cache_path, rows)
+                            local[ds] = {"date": ds, "rows": rows,
+                                         "end_delay": _end_delay(rows),
+                                         "max_delay": _max_delay(rows)[0],
+                                         "max_station": _max_delay(rows)[1],
+                                         "canceled": _is_day_canceled(rows)}
+                except Exception as e:  # noqa: BLE001
+                    local[ds] = {"date": ds, "rows": [], "end_delay": None,
+                                 "max_delay": None, "max_station": "",
+                                 "error": str(e)[:80]}
+            # 线程内串行间隔（分片最后一项后不再睡——原实现此处白睡 2s）
+            if j < len(shard) - 1 and ZF_GAP_SEC > 0:
+                time.sleep(ZF_GAP_SEC)
+        return local
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for part in ex.map(_one_shard, shards):
+            results.update(part)
+
+    # ---- 阶段 3：按日期序复刻 early_bail 语义 ---------------------------
+    out: list[dict] = []
+    consec = 0
+    dead = False
+    for i in range(days - 1, -1, -1):
+        ds = (today - timedelta(days=i)).isoformat()
+        r = results.get(ds)
+        if r is None:                       # 理论不可达：todo+缓存应全覆盖
+            r = {"date": ds, "rows": [], "end_delay": None,
+                 "max_delay": None, "max_station": "", "error": "rate_limited"}
+        if dead:
+            r = {"date": ds, "rows": [], "end_delay": None,
+                 "max_delay": None, "max_station": "", "error": "rate_limited"}
+        elif r.get("error"):
+            consec += 1
+            if consec >= 2:
+                dead = True
+        else:
+            consec = 0
+        out.append(r)
+    return out
+
+
+def _atomic_write_json(path: str, rows) -> None:
+    """原子写 JSON（tmp + os.replace），避免并发/半写导致缓存损坏。永不抛异常。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp.%d" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _collect_serial(client: ZugfinderPro, train: str, days: int,
+                    gap: float = DEFAULT_DELAY) -> list[dict]:
+    """collect 的原始串行实现（2026-09-23 前的唯一路径），作并行兜底保留。"""
+    # 归一车次号（确保前缀后有下划线：RE7 → RE_7）
     today = date.today()
     out: list[dict] = []
     last_limited = False
@@ -184,9 +392,7 @@ def collect(client: ZugfinderPro, train: str, days: int,
                                     and "limitreaktivieren" not in _arr:
                                 rows = fresh_rows
                                 is_stale = False  # 重拉成功 → 数据已定型
-                                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                                with open(cache_path, "w", encoding="utf-8") as fh:
-                                    json.dump(rows, fh, ensure_ascii=False)
+                                _atomic_write_json(cache_path, rows)
                         except Exception:  # noqa: BLE001
                             pass  # 重拉失败 → 沿用旧缓存
                     if is_stale:
@@ -233,13 +439,8 @@ def collect(client: ZugfinderPro, train: str, days: int,
                         "canceled": _is_day_canceled(rows)})
             last_limited = False
             consecutive_limited = 0
-            # 写缓存
-            try:
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                with open(cache_path, "w", encoding="utf-8") as fh:
-                    json.dump(rows, fh, ensure_ascii=False)
-            except Exception:  # noqa: BLE001
-                pass
+            # 写缓存（原子写：并行/多进程同写同一路径时防半文件）
+            _atomic_write_json(cache_path, rows)
         except Exception as e:  # noqa: BLE001
             out.append({"date": ds, "rows": [], "end_delay": None,
                         "max_delay": None, "max_station": "",
@@ -406,6 +607,61 @@ def _parse_piebro_datetime(s) -> "datetime | None":
         return None
 
 
+# ---- PieBro 结果磁盘缓存（2026-09-23）--------------------------------------
+# 起因：冷查询端到端 16~34s 的剖析显示 collect_piebro_fallback 被调用多次
+# （含 main 里 60 天历史窗口那次），单次 2.3~4.7s，且 parquet 常驻读取是纯浪费。
+#
+# 为什么用磁盘而不是进程内 dict：常驻 worker 已占 3.25GB RssAnon / 8GB cgroup，
+# 结果集（8~60 天的逐站行）驻留内存会持续累积。磁盘缓存让内存零增长，
+# 且 spawn 式降级进程也能共享。这与 _load_line_trip_templates 的思路一致。
+#
+# 失效条件（任一即失效）：
+#   - parquet 文件指纹变化（数据更新）
+#   - 超过 24h TTL（兜底：防止同名文件原地重写导致指纹不变）
+_PIEBRO_CACHE_DIR = os.path.expanduser("~/.cache/train_insight_piebro")
+_PIEBRO_CACHE_TTL = 24 * 3600
+
+
+def _piebro_cache_key(train: str, days: int) -> str:
+    return "%s__%d" % (_norm_train_id(train) or "invalid", days)
+
+
+def _piebro_cache_fp() -> str:
+    return "|".join(_piebro_recent_files())
+
+
+def _piebro_cache_get(name: str):
+    """命中返回缓存值（list 或 dict），未命中/损坏返回 None。永不抛异常。"""
+    fp = os.path.join(_PIEBRO_CACHE_DIR, name + ".json")
+    try:
+        with open(fp, encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("key") != _piebro_cache_fp():
+        return None   # parquet 已更新 → 重算
+    if time.time() - rec.get("ts", 0) > _PIEBRO_CACHE_TTL:
+        return None
+    data = rec.get("data")
+    return data if isinstance(data, (list, dict)) else None
+
+
+def _piebro_cache_put(name: str, data: list) -> None:
+    """原子落盘（tmp + os.replace），避免并发写坏。永不抛异常。"""
+    try:
+        os.makedirs(_PIEBRO_CACHE_DIR, exist_ok=True)
+        fp = os.path.join(_PIEBRO_CACHE_DIR, name + ".json")
+        tmp = fp + ".tmp.%d" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"key": _piebro_cache_fp(), "ts": time.time(), "data": data},
+                      f, ensure_ascii=False)
+        os.replace(tmp, fp)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def collect_piebro_fallback(train: str, days: int = 30) -> list[dict]:
     """限流降级：从 PieBro 历史聚合该车次的**完整逐站延误**（无需登录/外部依赖）。
 
@@ -415,7 +671,25 @@ def collect_piebro_fallback(train: str, days: int = 30) -> list[dict]:
 
     返回 recs 与 collect() 同结构（rows 字段含真实站序 + 计划时刻 + 延误），
     让 /api/train 输出能直接渲染逐站曲线与今日时刻表。
+
+    性能（2026-09-23）：本函数一次请求内会被调用多次（含 60 天历史窗口），
+    实测单次 2.3~4.7s，叠起来是除去网络抓取之外最大的热点。故加磁盘结果缓存，
+    键为 (车次, 天数) + parquet 文件指纹；详见 _piebro_cache_get/_put。
     """
+    _ck = _piebro_cache_key(train, days)
+    _hit = _piebro_cache_get(_ck)
+    if _hit is not None:
+        return _hit
+    _res = _collect_piebro_uncached(train, days)
+    # 只有真正取到数据才落盘：空结果可能只是 parquet 尚未更新，缓存它会让
+    # 「下次就有的数据」被 24h 挡住。
+    if _res:
+        _piebro_cache_put(_ck, _res)
+    return _res
+
+
+def _collect_piebro_uncached(train: str, days: int = 30) -> list[dict]:
+    """collect_piebro_fallback 的实际计算部分（无缓存，纯读 parquet）。"""
     target_ln = _norm_train_id(train)
     if not target_ln:
         return []
@@ -1017,6 +1291,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# ---- collect 并行抓取（2026-09-23）------------------------------------------
+# 起因：冷查询剖析显示 collect 的 8 天串行循环独占 ~16s，其中大头是
+# 「每天拉完无条件 time.sleep(gap=2.0)」——8 天全 miss 就是 16s 纯睡眠。
+# 改为分片并行：把待抓日期交错分给 N 个线程，每个线程持**独立的 ZugfinderPro
+# 会话**（requests.Session 非线程安全，绝不能共享；且同账号并发 unfreeze 有竞态
+# ——vendor/zugfinder_pro.py:122 的解封是 GET→POST 两段式），线程内部串行+
+# 间隔，线程之间并行。墙钟时间 ≈ ceil(todo/workers) × (gap+请求)。
+#
+# 为什么是「每线程一个会话、同账号多次登录」而不是「多账号」：
+#   - 账号轮换是 collect_multi_account 的职责，语义是"账号挂了换号"，
+#     与"加速单账号抓取"是两回事，混在一起会让限流归因变糊涂。
+#   - zugfinder 的会话是 cookie 级，同账号多会话 ≈ 同一账号开多个浏览器；
+#     服务端按账号计数限流，总请求数不变，只是时间压缩。
+#
+# 安全阀：
+#   - workers 可用 ZUGFINDER_FETCH_WORKERS 调回 1（= 完全串行）
+#   - 待抓天 ≤2 时直接串行，省掉线程池与 N-1 次登录的开销
+#   - 并行路径任何异常 → 静默退回原串行实现（_collect_serial 原样保留）
+#   - 限流频率若上升（日志盯 zu viele abfragen / unfreeze），先把 workers 调 2
+ZF_FETCH_WORKERS = max(1, min(4, _env_int("ZUGFINDER_FETCH_WORKERS", 3)))
+try:
+    ZF_GAP_SEC = max(0.0, float(os.environ.get("ZUGFINDER_GAP_SEC", "1.5")))
+except ValueError:
+    ZF_GAP_SEC = 1.5
+
+
 # 多账号轮换上限：账号池有 29 个备用，但每账号冷跑要 8 天 × gap≈16s，
 # 无脑放大到 29 会让最坏耗时冲到 460s+（前端 160s 就超时了）。
 # 因此用「数量上限 + 时间预算」双闸门兜底：先到者生效。
@@ -1082,7 +1382,7 @@ def collect_multi_account(train: str, days: int, gap: float = DEFAULT_DELAY,
                 print("WARNING: 备用账号登录失败（第 %d 个）: %s"
                       % (idx, str(e)[:60]), file=sys.stderr, flush=True)
             continue
-        recs = collect(client, train, days, gap)
+        recs = collect(client, train, days, gap, cred=cred)
         if any(r.get("end_delay") is not None for r in recs):
             if idx > 0:
                 print("INFO: 主账号限流，已切换到第 %d 个备用账号"
@@ -1298,7 +1598,28 @@ def cancel_prob_piebro(train: str, days: int = 30,
         站点所属州与主线重合度 ≥60% 的班次，避免把另一条同名线（如 RE 11
         的 Hoyerswerda↔Leipzig 线）的取消率混进来。
     注：完全取消且数据未收录的班次无法识别，结果为「有记录班次」中的取消率。
+
+    性能（2026-09-23）：与 collect_piebro_fallback 一样每次都重扫 parquet，
+    实测 1.5s/次。套用同款磁盘结果缓存（指纹 + 24h TTL）。
     """
+    _ck = _piebro_cache_key(train, days) + "__cancel"
+    # main_states 参与计算结果（跨线剔除），必须进 key —— 否则不同指纹的调用
+    # 会互串缓存，返回错误取消率。
+    if main_states:
+        _ck += "__st" + hashlib.sha1(
+            ",".join(sorted(str(s) for s in main_states)).encode()).hexdigest()[:10]
+    _hit = _piebro_cache_get(_ck)
+    if _hit is not None:
+        return _hit
+    _res = _cancel_prob_uncached(train, days, main_states)
+    if _res.get("n_rides"):
+        _piebro_cache_put(_ck, _res)
+    return _res
+
+
+def _cancel_prob_uncached(train: str, days: int = 30,
+                          main_states: set | None = None) -> dict:
+    """cancel_prob_piebro 的实际计算部分（无缓存）。"""
     target_ln = _norm_train_id(train)
     if not target_ln or not os.path.isdir(PIEBRO_DIR):
         return _empty_cancel_prob()
